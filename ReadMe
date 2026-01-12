@@ -1,0 +1,45 @@
+Local env requirements:
+- docker (last tested as v29.1.3)
+- docker-compose (last tested as v2.40.3)
+Available at:
+https://www.docker.com/get-started
+
+// Step 0: Prepare Vlab-5.0 directory (only needs to be done if vlab-5.0 directory is not present): //
+
+tar -xzf vlab-5.0-3609-ubuntu-20_04.tar.gz
+
+
+// Step 1: To create container: //
+
+./start.sh
+
+-- OR --
+
+docker-compose up --force-recreate --build -d
+
+
+// Step 2: To attach to container and start a bash shell: //
+
+. ./connect.sh
+
+-- OR --
+
+docker exec -it instance1 bash
+
+
+// Step 3: Once attached, run the following to install vlab and set up environment: //
+
+. ./setup.sh (once the default config file is copied, press 'enter' key to finalize, this will take several minutes)
+
+-- OR --
+
+. ./vdsetup.sh (for virtual display, same process as . ./setup.sh but vlab wont start automatically)
+
+// Step 4: Virtual Display Setup (only for vdsetup option): //
+
+Connect to the virtual display by connecting to localhost:6080 in your web browser.
+Start vLab by using the following command in the virtual display terminal:
+
+. ./vlab_setup.sh
+
+The browser app window should open after running this command, and vLab should be functional.

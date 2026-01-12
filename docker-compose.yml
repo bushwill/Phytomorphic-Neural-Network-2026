@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  app1:
+    container_name: instance1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: tail -f /dev/null
+    ports:
+      - "6080:6080"
+    restart: unless-stopped

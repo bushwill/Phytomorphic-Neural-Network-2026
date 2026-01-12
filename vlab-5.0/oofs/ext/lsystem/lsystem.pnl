@@ -1,0 +1,87 @@
+target: Lsystem
+panel name: Parameters
+background: 255,255,255
+size: 329 340
+font: Arial,14,-1,5,50,0,0,0,0,0
+
+type: LABEL
+name: GENERAL
+color: 25,25,204
+origin: 135 4
+
+type: LABEL
+name: SCALING
+color: 25,25,204
+origin: 133 136
+
+type: SLIDER
+name: IntLen / 10
+colors: 0,0,0 0,153,0
+origin: 12 163
+min/max: 0 20
+value: 7
+message: d IntLen %d 10
+
+type: SLIDER
+name: ExpIntRad / 100
+colors: 0,0,0 0,153,0
+origin: 12 289
+min/max: 0 100
+value: 50
+message: d ExpIntRad %d 100
+
+type: SLIDER
+name: LeafLen / 10
+colors: 0,0,0 0,153,0
+origin: 180 163
+min/max: 1 100
+value: 50
+message: d LeafLen %d 10
+
+type: SLIDER
+name: LeafWid / 100
+colors: 0,0,0 0,153,0
+origin: 180 226
+min/max: 1 200
+value: 100
+message: d LeafWid %d 100
+
+type: SLIDER
+name: ExpLeafWid / 100
+colors: 0,0,0 0,153,0
+origin: 180 289
+min/max: 1 100
+value: 50
+message: d ExpLeafWid %d 100
+
+type: SLIDER
+name: Phytomers
+colors: 0,0,0 0,153,0
+origin: 12 30
+min/max: 1 20
+value: 10
+message: d MAX_PHYTOMERS %d 1
+
+type: SLIDER
+name: Plastochron / 10
+colors: 0,0,0 0,153,0
+origin: 180 30
+min/max: 1 100
+value: 30
+message: d PLASTOCHRON %d 10
+
+type: SLIDER
+name: IntWid / 100
+colors: 0,0,0 0,153,0
+origin: 12 226
+min/max: 1 200
+value: 90
+message: d IntWid %d 100
+
+type: SLIDER
+name: Branching Angle
+colors: 0,0,0 0,153,0
+origin: 12 91
+min/max: 0 270
+value: 135
+message: d BrAngle %d 1

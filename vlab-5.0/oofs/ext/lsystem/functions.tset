@@ -1,0 +1,50 @@
+timeEdit 1 2
+items: 3
+start: 0
+end: 6.08941
+name: BR_ANGLE
+startLabel: Start
+endLabel: End
+timelineFunceditFileStart:
+fver 1 1
+name: BR_ANGLE
+samples: 100
+flip: off
+points: 4
+0.000000 0.000567 1
+0.510242 0.045323 1
+0.715080 0.526692 1
+1.000000 0.997820 1
+timelineFunceditFileEnd:
+start: 0
+end: 5.82858
+name: LEAF_LENGTH
+startLabel: Start
+endLabel: End
+timelineFunceditFileStart:
+fver 1 1
+name: LEAF_LENGTH
+samples: 100
+flip: off
+points: 4
+0.000000 0.001460 1
+0.424528 -0.000248 1
+0.603418 0.998605 1
+1.000000 0.998605 1
+timelineFunceditFileEnd:
+start: 0.0066165
+end: 1.53092
+name: INTERNODE_LENGTH
+startLabel: Start
+endLabel: End
+timelineFunceditFileStart:
+fver 1 1
+name: INTERNODE_LENGTH
+samples: 100
+flip: off
+points: 4
+0.000000 0.001460 1
+0.201707 -0.000248 1
+0.461802 0.682540 1
+1.000000 0.992898 1
+timelineFunceditFileEnd:

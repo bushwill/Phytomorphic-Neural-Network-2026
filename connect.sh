@@ -1,0 +1,1 @@
+docker exec -it instance1 bash
