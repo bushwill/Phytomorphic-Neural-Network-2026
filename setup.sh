@@ -24,7 +24,7 @@ echo "=== VLAB Installation Process ==="
 echo "Step 1: Distribution already extracted to /app/vlab-5.0"
 
 # Change to vlab directory for Step 1d
-cd /app/vlab-5.0
+cd /app/vlab
 
 echo "Step 1d: Running postinstall.sh..."
 ./bin/postinstall.sh
@@ -54,11 +54,11 @@ echo "  VLABBIN: $VLABBIN"
 echo "  PATH includes VLAB: $(echo $PATH | grep -o '[^:]*vlab[^:]*')"
 
 if command -v vlab-splash >/dev/null 2>&1; then
-    echo "✅ VLAB installation successful! vlab-splash command found."
+    echo "VLAB installation successful! vlab-splash command found."
 elif command -v browser >/dev/null 2>&1; then
-    echo "✅ VLAB tools available! browser command found."
+    echo "VLAB tools available! browser command found."
 else
-    echo "⚠️  VLAB commands not found in PATH."
+    echo "VLAB commands not found in PATH."
     echo "Current PATH: $PATH"
     echo "Expected VLABBIN: $VLABBIN"
 fi

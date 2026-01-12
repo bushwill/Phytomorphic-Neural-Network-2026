@@ -20,7 +20,7 @@ from utils_nn import (build_random_parameter_file, compute_normalization_stats,
                       log_training_step, print_training_progress,
                       generate_and_evaluate)
 
-model_name = "surrogate_model.pt"
+model_name = "data/surrogate_model.pt"
 accuracy_threshold = 0.01
 
 class StructureGenerationNet(nn.Module):

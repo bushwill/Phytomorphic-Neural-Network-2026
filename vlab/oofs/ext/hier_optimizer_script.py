@@ -40,8 +40,8 @@ diversity_amount = 0.1
 accuracy_threshold = 0.01
 boundary_penalty_weight = 0.1   # New: weight for soft boundary penalty
 
-directory = "Normal Data/Final/"
-optimizer_directory = "Optimizer/"
+directory = "data/Normal Data/Final/"
+optimizer_directory = "data/Optimizer/"
 
 # Create optimizer directory if it doesn't exist
 if not os.path.exists(optimizer_directory):

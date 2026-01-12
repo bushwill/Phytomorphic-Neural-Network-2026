@@ -6,7 +6,7 @@
 echo "Setting up VLAB environment..."
 
 # Change to vlab directory
-cd /app/vlab-5.0
+cd /app/vlab
 
 # Run VLAB post-installation if not already done
 if [ ! -f "bin/sourceme.sh" ]; then

@@ -29,7 +29,7 @@ real_plant_name = "Plant_063-32"
 plant_image_path = plant_images_path + real_plant_name
 size_x = 50  #top best plants we want to know
 parameter_number = 12
-file_path = "./synthetic_images/"
+file_path = "./data/synthetic_images/"
 
 
 def make_index(cost_):

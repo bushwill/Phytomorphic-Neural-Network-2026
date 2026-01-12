@@ -11,7 +11,7 @@ import time as t
 
 def clear_surrogate_dir():
     """Clear and create surrogate directory for clean runs"""
-    folder = "surrogate"
+    folder = "data/surrogate"
     if not os.path.exists(folder):
         os.makedirs(folder)
     else:
@@ -161,10 +161,10 @@ def generate_plant(param_file, output_dir):
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    lpfg_command = f"lpfg -w 306 256 lsystem.l view.v materials.mat contours.cset functions.fset functions.tset {param_file} > {output_dir}/lpfg_log.txt"
+    lpfg_command = f"lpfg -w 306 256 lsystem/lsystem.l lsystem/view.v lsystem/materials.mat lsystem/contours.cset lsystem/functions.fset lsystem/functions.tset {param_file} > {output_dir}/lpfg_log.txt"
     # Compile project if needed
     if not os.path.exists("project"):
-        os.system("g++ -o project -Wall -Wextra project.cpp -lm")
+        os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
     # Run lpfg
     process = subprocess.Popen(['bash', '-c', lpfg_command])
     process.wait()
@@ -284,19 +284,19 @@ def generateSurrogatePlant(param_file, calculate_cost_fn=None):
     """
     # setup call to lpfg
     # lpfg_command = "lpfg -w 306 256 lsystem.l view.v materials.mat -a anim.a contours.cset functions.fset functions.tset loop_parameters.vset > log.txt"
-    lpfg_command = f"lpfg -w 306 256 lsystem.l view.v materials.mat contours.cset functions.fset functions.tset {param_file} > surrogate/lpfg_log.txt"
+    lpfg_command = f"lpfg -w 306 256 lsystem/lsystem.l lsystem/view.v lsystem/materials.mat lsystem/contours.cset lsystem/functions.fset lsystem/functions.tset {param_file} > data/surrogate/lpfg_log.txt"
 
     if not os.path.exists("project"):
-        os.system("g++ -o project -Wall -Wextra project.cpp -lm")
+        os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
     
-    if not os.path.exists("surrogate"):
-        os.mkdir("surrogate")
+    if not os.path.exists("data/surrogate"):
+        os.makedirs("data/surrogate")
 
     # run lpfg  
     process = subprocess.Popen(['bash', '-c', lpfg_command])
     process.wait()
-    os.system(f"./project 2454 2056 leafposition.dat > surrogate/output.txt")
-    dest_path = "./surrogate/leafposition.dat"
+    os.system(f"./project 2454 2056 leafposition.dat > data/surrogate/output.txt")
+    dest_path = "./data/surrogate/leafposition.dat"
     if os.path.exists(dest_path):
         os.remove(dest_path)
     shutil.move("leafposition.dat", dest_path)
@@ -305,7 +305,7 @@ def generateSurrogatePlant(param_file, calculate_cost_fn=None):
     if calculate_cost_fn is not None:
         syn_bp, syn_ep = read_syn_plant_surrogate()
         return calculate_cost_fn(syn_bp, syn_ep)
-def read_syn_plant_surrogate(file_name="surrogate/output.txt"):
+def read_syn_plant_surrogate(file_name="data/surrogate/output.txt"):
     f = open(file_name, "r")
     lines = f.readlines()
     day_temp = 0
