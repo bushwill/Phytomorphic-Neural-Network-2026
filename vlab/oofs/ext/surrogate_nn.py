@@ -161,7 +161,7 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         bp_syn, bp_probs, ep_syn, ep_probs = self.structure_gen(x_norm)
         
         if real_bp_batch is None or real_ep_batch is None:
-            # During inference, return structure predictions
+            # return structure predictions when no real plant is provided
             return bp_syn, bp_probs, ep_syn, ep_probs
         
         # Compute Hungarian assignment and costs for each day
@@ -297,7 +297,6 @@ if __name__ == "__main__":
         iter_start_time = time.time()
         clear_surrogate_dir()
         
-        # 1. Generate random parameters and write to file
         # 1. Generate random parameters and write to file
         params = build_random_parameter_file("surrogate_params.vset")
         params_tensor = torch.tensor(params, dtype=torch.float32).unsqueeze(0)

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<plant>
+    <id>Plant_063-32_SideView0/Day_006.jpg</id>
+    <base>
+        <x>1300.0</x>
+        <y>1837.0</y>
+    </base>
+    <leaf>
+        <id>1</id>
+        <status>alive</status>
+        <tip>
+            <x>1340.0</x>
+            <y>1689.0</y>
+        </tip>
+        <collar>
+            <x>1303.0</x>
+            <y>1764.0</y>
+        </collar>
+    </leaf>
+    <leaf>
+        <id>2</id>
+        <status>alive</status>
+        <tip>
+            <x>1111.0</x>
+            <y>1596.0</y>
+        </tip>
+        <collar>
+            <x>1296.0</x>
+            <y>1742.0</y>
+        </collar>
+    </leaf>
+    <leaf>
+        <id>3</id>
+        <status>alive</status>
+        <tip>
+            <x>1249.0</x>
+            <y>1498.0</y>
+        </tip>
+        <collar>
+            <x>1296.0</x>
+            <y>1728.0</y>
+        </collar>
+    </leaf>
+</plant>

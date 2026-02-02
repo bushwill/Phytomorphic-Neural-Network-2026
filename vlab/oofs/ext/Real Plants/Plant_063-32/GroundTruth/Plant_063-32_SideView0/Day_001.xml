@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<plant>
+    <id>Plant_063-32_SideView0/Day_001.jpg</id>
+    <base>
+        <x>1306.0</x>
+        <y>1837.0</y>
+    </base>
+    <leaf>
+        <id>1</id>
+        <status>alive</status>
+        <tip>
+            <x>1316.0</x>
+            <y>1784.0</y>
+        </tip>
+        <collar>
+            <x>1308.0</x>
+            <y>1821.0</y>
+        </collar>
+    </leaf>
+</plant>
