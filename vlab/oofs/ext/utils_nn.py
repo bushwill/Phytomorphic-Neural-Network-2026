@@ -1,6 +1,7 @@
 from numpy.random import normal as nran
 from numpy.random import uniform as uran
 import os
+import sys
 import subprocess
 import shutil
 from plant_comparison_nn import calculate_cost, read_real_plants
@@ -23,6 +24,12 @@ def clear_surrogate_dir():
 def setup_training_csv(model_name, param_count=13):
     """Setup CSV file for training logs with proper headers"""
     csv_file = model_name + ".csv"
+    
+    # Ensure directory exists
+    directory = os.path.dirname(csv_file)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory)
+
     existing_rows = []
     start_run = 0
     prev_losses = []
@@ -164,12 +171,19 @@ def generate_plant(param_file, output_dir):
     lpfg_command = f"lpfg -w 306 256 lsystem/lsystem.l lsystem/view.v lsystem/materials.mat lsystem/contours.cset lsystem/functions.fset lsystem/functions.tset {param_file} > {output_dir}/lpfg_log.txt"
     # Compile project if needed
     if not os.path.exists("project"):
-        os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
+        ret = os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
+        if ret != 0:
+            print("Error: Compilation of lsystem/project.cpp failed. Exiting.")
+            sys.exit(1)
     # Run lpfg
     process = subprocess.Popen(['bash', '-c', lpfg_command])
     process.wait()
     os.system(f"./project 2454 2056 leafposition.dat > {output_dir}/output.txt")
-    shutil.move("leafposition.dat", f"./{output_dir}")
+    dest_path = os.path.join(output_dir, "leafposition.dat")
+    if os.path.exists(dest_path):
+        os.remove(dest_path)
+    if os.path.exists("leafposition.dat"):
+        shutil.move("leafposition.dat", dest_path)
 
 def read_syn_plant(file_name):
     """
@@ -287,7 +301,10 @@ def generateSurrogatePlant(param_file, calculate_cost_fn=None):
     lpfg_command = f"lpfg -w 306 256 lsystem/lsystem.l lsystem/view.v lsystem/materials.mat lsystem/contours.cset lsystem/functions.fset lsystem/functions.tset {param_file} > data/surrogate/lpfg_log.txt"
 
     if not os.path.exists("project"):
-        os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
+        ret = os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
+        if ret != 0:
+            print("Error: Compilation of lsystem/project.cpp failed. Exiting.")
+            sys.exit(1)
     
     if not os.path.exists("data/surrogate"):
         os.makedirs("data/surrogate")

@@ -6,7 +6,7 @@ apt-get update && apt-get install -y sudo
 sudo apt-get update && \
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common && \
 sudo add-apt-repository -y universe && \
-sudo apt-get install -y qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools build-essential xvfb freeglut3-dev
+sudo apt-get install -y qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools build-essential xvfb freeglut3-dev libglm-dev
 sudo apt-get install -y python3 python3-pip python3-numpy python3-pandas python3-skimage python3-munkres
 sudo pip3 install --break-system-packages skan torch
 

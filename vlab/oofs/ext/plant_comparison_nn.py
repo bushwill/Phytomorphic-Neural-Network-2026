@@ -24,7 +24,7 @@ from timeit import default_timer as timer
 
 global real_plant_name, size_x, parameter_number, file_path
 
-plant_images_path = "./Original_Images/"
+plant_images_path = "./Real Plants/"
 real_plant_name = "Plant_063-32"
 plant_image_path = plant_images_path + real_plant_name
 size_x = 50  #top best plants we want to know

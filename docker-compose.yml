@@ -9,4 +9,6 @@ services:
     command: tail -f /dev/null
     ports:
       - "6080:6080"
+    volumes:
+      - ./vlab/oofs/ext/Datasets:/app/vlab/oofs/ext/Datasets
     restart: unless-stopped

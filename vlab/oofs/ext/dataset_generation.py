@@ -8,11 +8,27 @@ import plant_comparison_nn
 from utils_nn import build_random_parameter_file, generate_plant, read_syn_plant
 from plant_comparison_nn import read_real_plants, calculate_cost
 
+import sys
+
+class DualLogger:
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.log = open(filepath, "w")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
 def generate_dataset_split(split_name, size, real_bp, real_ep, output_dir):
     """
     Generates a dataset split (Train, Val, or Test).
     """
-    print(f"\nGeneraring {split_name} dataset ({size} samples)...")
+    print(f"\nGenerating {split_name} dataset ({size} samples)...")
     
     # Create directories
     split_dir = os.path.join(output_dir, split_name)
@@ -93,9 +109,9 @@ def generate_dataset_split(split_name, size, real_bp, real_ep, output_dir):
 
 def main():
     DEFAULT_PLANT = "Plant_063-32"
-    DEFAULT_TRAIN = 100
-    DEFAULT_VAL = 20
-    DEFAULT_TEST = 20
+    DEFAULT_TRAIN = 30000
+    DEFAULT_VAL = 100
+    DEFAULT_TEST = 5000
     DEFAULT_OUT = "Datasets"
 
     parser = argparse.ArgumentParser(description="Generate datasets for PhytomorphicNN")
@@ -110,7 +126,7 @@ def main():
     # Setup Real Plant Path logic in plant_comparison_nn
     # Note: plant_comparison_nn uses global variables, so we modify them here if possible
     # or ensure the path structure matches what it expects.
-    # By default, it looks in ./Original_Images/{plant_name}
+    # By default, it looks in ./Real Plants/{plant_name}
     
     print(f"Target Real Plant: {args.plant}")
     
@@ -125,12 +141,17 @@ def main():
         print(f"Successfully loaded real plant data ({len(real_bp)} days).")
     except Exception as e:
         print(f"Failed to read real plant data: {e}")
-        print("Make sure 'Original_Images/' directory exists and contains the plant folder.")
+        print("Make sure 'Real Plants/' directory exists and contains the plant folder.")
         return
 
     # Create main output directory
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    # Setup logging
+    log_file = os.path.join(args.output_dir, "generation_log.txt")
+    sys.stdout = DualLogger(log_file)
+    print(f"Logging to {log_file}")
         
     # Generate Splits
     if args.train_size > 0:
