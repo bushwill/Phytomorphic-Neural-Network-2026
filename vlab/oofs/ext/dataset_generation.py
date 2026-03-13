@@ -1,14 +1,24 @@
 import os
+import time
 import csv
 import torch
 import shutil
 import argparse
 import numpy as np
 import plant_comparison_nn
+from datetime import datetime
 from utils_nn import build_random_parameter_file, generate_plant, read_syn_plant
 from plant_comparison_nn import read_real_plants, calculate_cost
-
 import sys
+import datetime
+
+# ==========================================
+#              USER SETTINGS
+# ==========================================
+DEFAULT_PLANT = "Plant_063-32"   # Target real plant folder name
+DEFAULT_TRAIN_SIZE = 480000      # Number of training samples
+DEFAULT_VAL_SIZE = 100           # Number of validation samples
+DEFAULT_TEST_SIZE = 10000        # Number of test samples
 
 class DualLogger:
     def __init__(self, filepath):
@@ -28,6 +38,7 @@ def generate_dataset_split(split_name, size, real_bp, real_ep, output_dir):
     """
     Generates a dataset split (Train, Val, or Test).
     """
+    split_start_time = time.time()
     print(f"\nGenerating {split_name} dataset ({size} samples)...")
     
     # Create directories
@@ -105,23 +116,35 @@ def generate_dataset_split(split_name, size, real_bp, real_ep, output_dir):
         os.remove(temp_param_file)
     if os.path.exists(temp_output_dir):
         shutil.rmtree(temp_output_dir)
-    print(f"Finished {split_name} dataset.")
+        
+    split_end_time = time.time()
+    split_duration = split_end_time - split_start_time
+    print(f"Finished {split_name} dataset. Time: {split_duration:.2f}s")
 
 def main():
-    DEFAULT_PLANT = "Plant_063-32"
-    DEFAULT_TRAIN = 30000
-    DEFAULT_VAL = 100
-    DEFAULT_TEST = 5000
-    DEFAULT_OUT = "Datasets"
+    # Generate output directory based on current date
+    current_date = datetime.datetime.now().strftime("%m%d%y")
+    
+    # Auto-incrementing Dataset Folder
+    base_name = f"Run {current_date}"
+    counter = 0
+    candidate_name = base_name
+    
+    while os.path.exists(os.path.join("Datasets", candidate_name)):
+        counter += 1
+        candidate_name = f"{base_name}_{counter}"
+        
+    DEFAULT_OUT = os.path.join("Datasets", candidate_name)
 
     parser = argparse.ArgumentParser(description="Generate datasets for PhytomorphicNN")
     parser.add_argument("--plant", type=str, default=DEFAULT_PLANT, help=f"Name of the real plant folder (default: {DEFAULT_PLANT})")
-    parser.add_argument("--train_size", type=int, default=DEFAULT_TRAIN, help=f"Number of training samples (default: {DEFAULT_TRAIN})")
-    parser.add_argument("--val_size", type=int, default=DEFAULT_VAL, help=f"Number of validation samples (default: {DEFAULT_VAL})")
-    parser.add_argument("--test_size", type=int, default=DEFAULT_TEST, help=f"Number of test samples (default: {DEFAULT_TEST})")
+    parser.add_argument("--train_size", type=int, default=DEFAULT_TRAIN_SIZE, help=f"Number of training samples (default: {DEFAULT_TRAIN_SIZE})")
+    parser.add_argument("--val_size", type=int, default=DEFAULT_VAL_SIZE, help=f"Number of validation samples (default: {DEFAULT_VAL_SIZE})")
+    parser.add_argument("--test_size", type=int, default=DEFAULT_TEST_SIZE, help=f"Number of test samples (default: {DEFAULT_TEST_SIZE})")
     parser.add_argument("--output_dir", type=str, default=DEFAULT_OUT, help=f"Output directory (default: {DEFAULT_OUT})")
     
     args = parser.parse_args()
+
     
     # Setup Real Plant Path logic in plant_comparison_nn
     # Note: plant_comparison_nn uses global variables, so we modify them here if possible
@@ -148,6 +171,7 @@ def main():
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
+    start_time = time.time()
     # Setup logging
     log_file = os.path.join(args.output_dir, "generation_log.txt")
     sys.stdout = DualLogger(log_file)
@@ -163,6 +187,29 @@ def main():
     if args.test_size > 0:
         generate_dataset_split("Test", args.test_size, real_bp, real_ep, args.output_dir)
         
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"\nTotal Dataset Generation Time: {elapsed_time:.2f} seconds ({elapsed_time/3600:.2f} hours)")
+        
+    # Generate description.txt
+    desc_path = os.path.join(args.output_dir, "description.txt")
+    print(f"Creating description file: {desc_path}")
+    try:
+        with open(desc_path, "w") as f:
+            f.write(f"Dataset Description\n")
+            f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Generator Script: dataset_generation.py (Random Sampling)\n")
+            f.write(f"Target Plant: {args.plant}\n")
+            f.write(f"Output Directory: {args.output_dir}\n\n")
+            f.write("=== Split Sizes ===\n")
+            f.write(f"Train: {args.train_size}\n")
+            f.write(f"Validation: {args.val_size}\n")
+            f.write(f"Test: {args.test_size}\n")
+            f.write(f"Total Samples: {args.train_size + args.val_size + args.test_size}\n")
+            f.write(f"Total Generation Time: {elapsed_time:.2f} seconds ({elapsed_time/3600:.2f} hours)\n")
+    except Exception as e:
+        print(f"Error creating description file: {e}")
+
     print("\nDataset generation complete!")
 
 if __name__ == "__main__":

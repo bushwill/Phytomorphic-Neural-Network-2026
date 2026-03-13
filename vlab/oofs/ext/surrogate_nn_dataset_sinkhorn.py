@@ -1,8 +1,8 @@
 """
-Hierarchical surrogate neural network for plant cost prediction.
+Hierarchical surrogate neural network for plant cost prediction with Sinkhorn-based Assignment.
 Decomposes the problem into specialized modules:
 1. Structure Generation Network (generates branch/end points from parameters)
-2. Hungarian Assignment Network (learns optimal assignment patterns)
+2. Sinkhorn Assignment Network (differentiable, permutation-invariant assignment)
 3. Cost Aggregation Network (combines assignments into final cost)
 """
 
@@ -15,11 +15,12 @@ import os
 import sys
 import time as t
 import csv
+import math
 import numpy as np
 from plant_comparison_nn import read_real_plants
 from utils_nn import (setup_training_csv, log_training_stats)
 
-model_name = "data/surrogate_model.pt"
+model_name = "data/surrogate_model_sinkhorn.pt"
 accuracy_threshold = 0.01
 
 class PlantDataset(Dataset):
@@ -84,101 +85,147 @@ class StructureGenerationNet(nn.Module):
         
         return bp_coords, bp_probs, ep_coords, ep_probs
 
-class HungarianAssignmentNet(nn.Module):
-    """Learns to predict optimal assignment patterns and costs"""
-    def __init__(self, max_points=50):
+def log_sinkhorn_iterations(log_alpha, n_iters=5):
+    """ 
+    Perform Sinkhorn normalization in log-space for stability.
+    log_alpha: [batch_size, N, N] - Log of the score matrix
+    """
+    for _ in range(n_iters):
+        # Row normalization
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
+        # Column normalization 
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
+    return log_alpha.exp()
+
+class PointSetEncoder(nn.Module):
+    """
+    Encodes a set of points (branches) in a permutation-invariant way using Attention.
+    """
+    def __init__(self, input_dim=4, hidden_dim=64):
+        super().__init__()
+        # Embed each point independently
+        self.embedding = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        # Self-attention to understand context (how this branch relates to others in the same plant)
+        self.self_attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        # x: [batch, num_points, input_dim]
+        emb = self.embedding(x)
+        
+        # Self-attention
+        attn_out, _ = self.self_attention(emb, emb, emb)
+        return self.norm(emb + attn_out)
+
+class SinkhornAssignmentNet(nn.Module):
+    """
+    Learns to predict optimal assignment patterns using Sinkhorn iterations.
+    Permutation Invariant w.r.t input order of branches.
+    Handles 'ghost points' by weighting costs with existence probabilities.
+    """
+    def __init__(self, max_points=50, feature_dim=64):
         super().__init__()
         self.max_points = max_points
         
-        # Process pairs of structures (synthetic vs real)
-        self.structure_encoder = nn.Sequential(
-            nn.Linear(max_points * 8, 256),  # bp_syn, ep_syn, bp_real, ep_real (flattened: 4 * max_points * 2)
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
-        )
+        # Encoder for each branch (BPx, BPy, EPx, EPy)
+        self.encoder = PointSetEncoder(input_dim=4, hidden_dim=feature_dim)
         
-        # Predict assignment matrix (soft assignment weights)
-        self.assignment_net = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, max_points * max_points),  # Assignment matrix
-            nn.Softmax(dim=-1)
-        )
-        
-        # Predict assignment costs
-        self.cost_net = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)  # Remove Softplus to allow lower predictions
-        )
-        
-    def forward(self, bp_syn, ep_syn, bp_real, ep_real):
+        # Learnable temperature for Sinkhorn (log-space for stability)
+        self.log_temperature = nn.Parameter(torch.tensor(0.0)) # exp(0) = 1.0
+
+    def forward(self, bp_syn, ep_syn, bp_real, ep_real, bp_probs_syn=None, ep_probs_syn=None):
         batch_size = bp_syn.size(0)
         
-        # Normalize coordinates to 0-1 range to prevent massive activations
-        scale = 200.0
-        bp_syn_norm = bp_syn / scale
-        ep_syn_norm = ep_syn / scale
-        bp_real_norm = bp_real / scale
-        ep_real_norm = ep_real / scale
+        # 1. Construct Set Features
+        # Combine BP and EP into a single feature vector for each branch: [batch, max_points, 4]
+        syn_features = torch.cat([bp_syn, ep_syn], dim=-1)
+        real_features = torch.cat([bp_real, ep_real], dim=-1)
         
-        # Flatten and concatenate structures
-        structure_features = torch.cat([
-            bp_syn_norm.reshape(batch_size, -1),
-            ep_syn_norm.reshape(batch_size, -1),
-            bp_real_norm.reshape(batch_size, -1),
-            ep_real_norm.reshape(batch_size, -1)
-        ], dim=1)
+        # 2. Encode Sets (Permutation Invariant / Equivariant)
+        # syn_emb: [batch, max_points, feature_dim]
+        syn_emb = self.encoder(syn_features)
+        real_emb = self.encoder(real_features)
         
-        encoded = self.structure_encoder(structure_features)
+        # 3. Compute Similarity Matrix (Score Matrix)
+        # Ensure temperature is positive using exp(log_temp)
+        temperature = torch.exp(self.log_temperature)
         
-        # Predict assignment matrix and total cost
-        # Output shape: [batch, max_points, max_points]
-        assignment_weights = self.assignment_net(encoded).reshape(batch_size, self.max_points, self.max_points)
+        # [batch, N, D] @ [batch, D, N] -> [batch, N, N]
+        scores = torch.bmm(syn_emb, real_emb.transpose(1, 2)) / temperature
         
-        # Predict assignment costs
-        # The true costs are PHYSICAL distances (~sum of 50 points * 200 units = 10,000)
-        # But neural networks output ~0-1. 
-        # So we must scale the output UP to match real physical cost range.
-        cost_scale = 10000.0 
-        total_cost = self.cost_net(encoded) * cost_scale
+        # 4. Sinkhorn Normalization (Differentiable Assignment)
+        # Returns Doubly Stochastic Matrix P [batch, N, N]
+        assignment_matrix = log_sinkhorn_iterations(scores, n_iters=5)
         
-        return assignment_weights, total_cost
+        # 5. Compute "Physical" Cost Matrix with Ghost Point Handling
+        # The actual objective cost we want to minimize: Geometric Distance
+        
+        # Expand for broadcasting
+        syn_bp_exp = bp_syn.unsqueeze(2)
+        real_bp_exp = bp_real.unsqueeze(1)
+        syn_ep_exp = ep_syn.unsqueeze(2)
+        real_ep_exp = ep_real.unsqueeze(1)
+        
+        bp_dist = torch.norm(syn_bp_exp - real_bp_exp, dim=-1)
+        ep_dist = torch.norm(syn_ep_exp - real_ep_exp, dim=-1)
+        
+        physical_cost_matrix = bp_dist + ep_dist # [batch, N, N]
+        
+        # Handle Ghost Points: Multiply cost by existence probability
+        
+        if bp_probs_syn is not None and ep_probs_syn is not None:
+             # Combine probabilities (branch exists if both BP and EP exist/are valid)
+             # [batch, N, 1]
+             point_existence = (bp_probs_syn * ep_probs_syn).unsqueeze(-1)
+             
+             # Weight the physical cost: 
+             # If point exists (1.0), full cost. If not (0.0), cost is 0.
+             physical_cost_matrix = physical_cost_matrix * point_existence
+
+        # 6. Expected Cost
+        # Sum(P_ij * C_ij)
+        total_cost = torch.sum(assignment_matrix * physical_cost_matrix, dim=(-1, -2))
+        
+        # Reshape to [batch, 1] for compatibility
+        return assignment_matrix, total_cost.unsqueeze(-1)
 
 class CostAggregationNet(nn.Module):
-    """Aggregates costs across multiple days and assignment patterns"""
+    """Aggregates costs across multiple days"""
     def __init__(self, max_days=26):
         super().__init__()
         self.max_days = max_days
         
         # Process temporal sequence of costs
-        # Costs are ~10,000 range. Neural net expects ~0-1. 
-        # Normalize input costs down, then aggregate.
-        self.input_norm_scale = 10000.0
+        # Simple weighted sum or MLP
+        # The input costs are "Physical Costs" (distances ~1,000-100,000 range), but weights are initialized for normalized inputs (~1)
+        # We need BatchNorm to normalize inputs at runtime, or we can just divide by a constant
+        # BatchNorm is safer as it learns the true distribution
+        self.norm = nn.BatchNorm1d(max_days)
         
         self.temporal_net = nn.Sequential(
             nn.Linear(max_days, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1)  # Output is normalized cost
+            nn.Linear(32, 1)
         )
         
     def forward(self, daily_costs):
         # daily_costs: [batch_size, num_days]
-        # Normalize inputs down to ~0-1 range
-        norm_input = daily_costs / self.input_norm_scale
-        return self.temporal_net(norm_input)
+        # Normalize the costs before entering the MLP
+        norm_costs = self.norm(daily_costs)
+        return self.temporal_net(norm_costs)
 
 class HierarchicalPlantSurrogateNet(nn.Module):
-    """Hierarchical network combining all modules"""
+    """Hierarchical network combining all modules with Sinkhorn"""
     def __init__(self, input_dim=13, max_points=50, max_days=26, input_mean=None, input_std=None, output_mean=None, output_std=None):
         super().__init__()
         self.structure_gen = StructureGenerationNet(input_dim, max_points)
-        self.hungarian_net = HungarianAssignmentNet(max_points)
+        self.sinkhorn_net = SinkhornAssignmentNet(max_points) # Renamed from hungarian_net
         self.cost_aggregator = CostAggregationNet(max_days)
         
         # Use provided stats or default
@@ -203,22 +250,33 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         bp_syn, bp_probs, ep_syn, ep_probs = self.structure_gen(x_norm)
         
         if real_bp_batch is None or real_ep_batch is None:
-            # return structure predictions when no real plant is provided
             return bp_syn, bp_probs, ep_syn, ep_probs
         
-        # Compute Hungarian assignment and costs for each day
-        daily_costs = []
+        # Batch-process all days simultaneously
+        num_days = real_bp_batch.size(1)
+        max_points = bp_syn.size(1)
         
-        for day in range(real_bp_batch.size(1)):  # Iterate over days
-            bp_real_day = real_bp_batch[:, day, :, :]  # [batch_size, max_points, 2]
-            ep_real_day = real_ep_batch[:, day, :, :]  # [batch_size, max_points, 2]
-            
-            # Get assignment and cost for this day
-            assignment_weights, day_cost = self.hungarian_net(bp_syn, ep_syn, bp_real_day, ep_real_day)
-            daily_costs.append(day_cost)
+        # Expand synthetic structures for each day
+        # [batch, points, 2] -> [batch, 1, points, 2] -> [batch, num_days, points, 2] -> [batch*num_days, points, 2]
+        bp_syn_expanded = bp_syn.unsqueeze(1).expand(-1, num_days, -1, -1).reshape(-1, max_points, 2)
+        ep_syn_expanded = ep_syn.unsqueeze(1).expand(-1, num_days, -1, -1).reshape(-1, max_points, 2)
+        bp_probs_expanded = bp_probs.unsqueeze(1).expand(-1, num_days, -1).reshape(-1, max_points)
+        ep_probs_expanded = ep_probs.unsqueeze(1).expand(-1, num_days, -1).reshape(-1, max_points)
         
-        # Stack daily costs and aggregate
-        daily_costs_tensor = torch.stack(daily_costs, dim=1).squeeze(-1)  # [batch_size, num_days]
+        # Flatten real data
+        # [batch, num_days, points, 2] -> [batch*num_days, points, 2]
+        real_bp_flat = real_bp_batch.reshape(-1, max_points, 2)
+        real_ep_flat = real_ep_batch.reshape(-1, max_points, 2)
+        
+        # Compute Sinkhorn assignment for all batch-days at once
+        _, total_costs_flat = self.sinkhorn_net(
+            bp_syn_expanded, ep_syn_expanded, 
+            real_bp_flat, real_ep_flat, 
+            bp_probs_syn=bp_probs_expanded, ep_probs_syn=ep_probs_expanded
+        )
+        
+        # Reshape costs back to [batch, num_days]
+        daily_costs_tensor = total_costs_flat.view(batch_size, num_days)
         
         # Pad or truncate to max_days
         if daily_costs_tensor.size(1) < 26:
@@ -230,17 +288,11 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         # Final cost aggregation
         final_cost = self.cost_aggregator(daily_costs_tensor)
         
-        # Denormalize outputs with bias correction for low predictions
+        # Denormalize outputs with bias correction
         denorm_cost = final_cost * self.output_std + self.output_mean
         
-        # Apply a learnable bias correction to help with low-cost predictions
-        # This helps the model overcome systematic bias toward higher values
-        bias_correction = torch.where(denorm_cost < 60000, 
-                                    -1000 * torch.sigmoid((60000 - denorm_cost) / 5000), 
-                                    torch.zeros_like(denorm_cost))
-        
         # Enforce physical positivity constraint using Softplus
-        return F.softplus(denorm_cost + bias_correction)
+        return F.softplus(denorm_cost)
 
 def prepare_real_plant_batch(real_bp, real_ep, max_points=50):
     """Convert real plant data to fixed-size tensors for batch processing"""
@@ -272,23 +324,18 @@ def hierarchical_loss_function(pred_cost, true_cost, bp_syn, bp_probs, ep_syn, e
     cost_loss = F.mse_loss(pred_cost, true_cost)
     
     # Structure generation loss (encourage reasonable point distributions)
-    structure_loss = 0.0
-    
-    # Existence probability regularization (prevent too many/few points)
     bp_count_target = torch.tensor([min(len(day_bp), 50) for day_bp in real_bp]).float().mean()
     ep_count_target = torch.tensor([min(len(day_ep), 50) for day_ep in real_ep]).float().mean()
     
-    bp_count_pred = bp_probs.sum() / bp_probs.shape[0] # Average per batch item
-    ep_count_pred = ep_probs.sum() / ep_probs.shape[0] # Average per batch item
+    bp_count_pred = bp_probs.sum(dim=1).mean()
+    ep_count_pred = ep_probs.sum(dim=1).mean()
     
     count_loss = F.mse_loss(bp_count_pred, bp_count_target) + F.mse_loss(ep_count_pred, ep_count_target)
     
     # Reduced spatial distribution loss (to test lower positive bias)
     # Variance of coordinates (0-200) is high (~3000). 
     # We scale down significantly to match normalized cost loss (~0.01-0.1 range)
-    # Also scale coordinates down by 200 before calculating variance to be safe
-    scale = 200.0
-    coord_regularization = 1e-3 * (torch.var(bp_syn/scale) + torch.var(ep_syn/scale))
+    coord_regularization = 1e-5 * (torch.var(bp_syn) + torch.var(ep_syn))
     
     # Count MSE is typically ~10-25. Multiplier 0.005 brings it to ~0.05-0.1 range.
     total_loss = cost_loss + 0.005 * count_loss + coord_regularization
@@ -307,10 +354,6 @@ def validate_model(model, val_loader, real_bp_batch, real_ep_batch):
     num_batches = 0
     total_samples = 0
     
-    # We need the raw lists for the loss function, but they are global in main
-    # For validation loss, we can approximate or just use MSE
-    # Let's use MSE for validation loss tracking as it's the primary objective
-    
     with torch.no_grad():
         for val_params, val_costs in val_loader:
             batch_size = val_params.size(0)
@@ -322,11 +365,8 @@ def validate_model(model, val_loader, real_bp_batch, real_ep_batch):
             # Forward pass
             pred_cost = model(val_params, current_real_bp, current_real_ep)
             
-            # Use normalized loss for tracking to match training
-            pred_norm = (pred_cost - model.output_mean) / model.output_std
-            target_norm = (val_costs - model.output_mean) / model.output_std
-            batch_loss = F.mse_loss(pred_norm, target_norm)
-            
+            # Calculate metrics
+            batch_loss = F.mse_loss(pred_cost, val_costs)
             batch_mae = F.l1_loss(pred_cost, val_costs)
             batch_rel_err = torch.abs(pred_cost - val_costs) / (torch.abs(val_costs) + 1e-8)
             
@@ -407,8 +447,11 @@ if __name__ == "__main__":
     else:
         print(f"No existing model found at {model_name}, creating new model.")
     
+    # Enable anomaly detection for Sinkhorn debugging
+    # torch.autograd.set_detect_anomaly(True)
+    
     model.train()
-    print(f"Starting hierarchical training for {num_epochs} epochs...")
+    print(f"Starting hierarchical training for {num_epochs} epochs with Sinkhorn Assignment...")
     print("Validating every 100 samples processed.")
     
     start_time = time.time()
@@ -444,6 +487,10 @@ if __name__ == "__main__":
             total_loss_val.backward()
             optimizer.step()
             
+            # Clamp temperature to avoid numerical instability
+            # With log_temperature, we can clamp the log value to e.g. -5 (exp(-5) ~ 0.006)
+            model.sinkhorn_net.log_temperature.data.clamp_(min=-5.0)
+            
             epoch_loss += total_loss_val.item()
             epoch_batches += 1
             
@@ -476,8 +523,6 @@ if __name__ == "__main__":
     print("Evaluating on Test Set...")
     model.eval()
     test_errors = []
-    test_preds = []
-    test_actuals = []
     
     with torch.no_grad():
         for test_params, test_costs in test_loader:
@@ -489,8 +534,6 @@ if __name__ == "__main__":
             
             rel_err = torch.abs(pred - test_costs) / (torch.abs(test_costs) + 1e-8)
             test_errors.extend(rel_err.numpy().flatten())
-            test_preds.extend(pred.numpy().flatten())
-            test_actuals.extend(test_costs.numpy().flatten())
             
     test_acc = 100.0 * np.mean(np.array(test_errors) < accuracy_threshold)
     mean_rel_err = np.mean(test_errors)
@@ -499,9 +542,3 @@ if __name__ == "__main__":
     print(f"Test Accuracy: {test_acc:.2f}%")
     print(f"Mean Relative Error: {mean_rel_err:.4f}")
     print(f"Median Relative Error: {median_rel_err:.4f}")
-    
-    # Save a small report
-    with open("test_results.txt", "w") as f:
-        f.write(f"Test Accuracy: {test_acc:.2f}%\n")
-        f.write(f"Mean Relative Error: {mean_rel_err:.4f}\n")
-        f.write(f"Median Relative Error: {median_rel_err:.4f}\n")

@@ -21,8 +21,8 @@ def clear_surrogate_dir():
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
-def setup_training_csv(model_name, param_count=13):
-    """Setup CSV file for training logs with proper headers"""
+def setup_training_csv(model_name):
+    """Setup CSV file for training logs with proper headers for aggregate stats"""
     csv_file = model_name + ".csv"
     
     # Ensure directory exists
@@ -30,42 +30,38 @@ def setup_training_csv(model_name, param_count=13):
     if directory and not os.path.exists(directory):
         os.makedirs(directory)
 
-    existing_rows = []
-    start_run = 0
-    prev_losses = []
-    
-    if os.path.exists(csv_file):
-        with open(csv_file, "r") as f:
-            reader = csv.reader(f)
-            existing_rows = list(reader)
-            start_run = len(existing_rows) - 1  # subtract header
-            # Read previous losses (skip header)
-            for row in existing_rows[1:]:
-                try:
-                    prev_losses.append(float(row[5]))  # Use cost_loss column (index 5) for consistency
-                except Exception:
-                    pass
-    
+    # Check if header exists
     write_header = not os.path.exists(csv_file)
     if write_header:
         with open(csv_file, "a", newline="") as f:
             writer = csv.writer(f)
-            # Standard header for neural network training logs
-            writer.writerow(["run #", "datetime", "avg_loss", "avg_loss_change", "total_loss", "cost_loss", "structure_reg", "pred_cost", "true_cost"] + [f"param_{i}" for i in range(param_count)])
+            # Comprehensive header for ML analysis
+            writer.writerow([
+                "samples_processed", "epoch", "timestamp",
+                "train_loss", "val_loss",
+                "val_mae", "val_mse", "val_rmse",
+                "val_rel_error_mean", "val_rel_error_median", 
+                "val_accuracy_1pct"
+            ])
     
-    return start_run, prev_losses, csv_file
+    return csv_file
 
-def log_training_step(csv_file, run_number, total_loss_val, cost_loss, structure_reg, pred_cost, true_cost, params, avg_loss, avg_loss_change):
-    """Log a single training step to CSV"""
+def log_training_stats(csv_file, samples_processed, epoch, train_loss, val_stats):
+    """Log aggregate training statistics to CSV"""
     timestamp = t.strftime("%Y-%m-%d %H:%M:%S")
     with open(csv_file, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [run_number, timestamp, f"{avg_loss:.4f}", f"{avg_loss_change:.4f}", 
-             f"{total_loss_val:.4f}", f"{cost_loss:.4f}", 
-             f"{structure_reg:.4f}", f"{pred_cost:.4f}", f"{true_cost:.4f}"] +
-            [f"{p:.4f}" for p in params]
-        )
+        writer.writerow([
+            samples_processed, epoch, timestamp,
+            f"{train_loss:.6f}", 
+            f"{val_stats['loss']:.6f}",
+            f"{val_stats['mae']:.6f}",
+            f"{val_stats['mse']:.6f}",
+            f"{val_stats['rmse']:.6f}",
+            f"{val_stats['rel_err_mean']:.6f}",
+            f"{val_stats['rel_err_median']:.6f}",
+            f"{val_stats['accuracy']:.2f}"
+        ])
 
 def print_training_progress(idx, num_runs, start_run, avg_loss, total_loss_val, cost_loss, accuracy_1000, current_lr, start_time, rel_error=None, pred_cost=None, true_cost=None):
     """Print standardized training progress with meaningful metrics"""
@@ -165,25 +161,58 @@ def compute_normalization_stats(num_samples = 100, real_bp=None, real_ep=None):
 def generate_plant(param_file, output_dir):
     """
     Generate a plant using lpfg and save results in output_dir.
+    Runs inside output_dir to prevent CWD file collisions (e.g. leafposition.dat).
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    lpfg_command = f"lpfg -w 306 256 lsystem/lsystem.l lsystem/view.v lsystem/materials.mat lsystem/contours.cset lsystem/functions.fset lsystem/functions.tset {param_file} > {output_dir}/lpfg_log.txt"
-    # Compile project if needed
+        
+    # Compile project if needed (in original CWD)
     if not os.path.exists("project"):
         ret = os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
         if ret != 0:
             print("Error: Compilation of lsystem/project.cpp failed. Exiting.")
             sys.exit(1)
-    # Run lpfg
-    process = subprocess.Popen(['bash', '-c', lpfg_command])
-    process.wait()
-    os.system(f"./project 2454 2056 leafposition.dat > {output_dir}/output.txt")
-    dest_path = os.path.join(output_dir, "leafposition.dat")
-    if os.path.exists(dest_path):
-        os.remove(dest_path)
-    if os.path.exists("leafposition.dat"):
-        shutil.move("leafposition.dat", dest_path)
+
+    # Get absolute paths to run safely from output_dir
+    cwd = os.getcwd()
+    abs_output_dir = os.path.abspath(output_dir)
+    abs_param_file = os.path.abspath(param_file)
+    project_exe = os.path.join(cwd, "project")
+    
+    # Function to get lsystem file paths
+    def ls(f): return os.path.join(cwd, "lsystem", f)
+
+    # Build lpfg command components (Using absolute paths)
+    lpfg_args = [
+        "lpfg", 
+        "-w", "306", "256", 
+        ls("lsystem.l"), 
+        ls("view.v"), 
+        ls("materials.mat"), 
+        ls("contours.cset"), 
+        ls("functions.fset"), 
+        ls("functions.tset"), 
+        abs_param_file
+    ]
+
+    # Run lpfg inside output_dir
+    # This ensures leafposition.dat is created inside output_dir, not CWD
+    log_file = os.path.join(abs_output_dir, "lpfg_log.txt")
+    with open(log_file, "w") as f_log:
+        process = subprocess.Popen(lpfg_args, cwd=abs_output_dir, stdout=f_log, stderr=subprocess.STDOUT)
+        process.wait()
+
+    # Run project executable to process leafposition.dat
+    # Expected input: ./project Width Height InputFile
+    # InputFile is now in abs_output_dir/leafposition.dat
+    leafval_file = "leafposition.dat" 
+    output_file = os.path.join(abs_output_dir, "output.txt")
+    
+    with open(output_file, "w") as f_out:
+        # execute project binary using absolute path
+        p_args = [project_exe, "2454", "2056", leafval_file]
+        p_proc = subprocess.Popen(p_args, cwd=abs_output_dir, stdout=f_out)
+        p_proc.wait()
 
 def read_syn_plant(file_name):
     """

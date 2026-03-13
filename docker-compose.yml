@@ -1,7 +1,5 @@
-version: "3.8"
-
 services:
-  app1:
+  instance1:
     container_name: instance1
     build:
       context: .
@@ -10,5 +8,29 @@ services:
     ports:
       - "6080:6080"
     volumes:
-      - ./vlab/oofs/ext/Datasets:/app/vlab/oofs/ext/Datasets
+      - ./vlab/oofs/ext:/app/vlab/oofs/ext
+    restart: unless-stopped
+
+  instance2:
+    container_name: instance2
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: tail -f /dev/null
+    ports:
+      - "6081:6080"
+    volumes:
+      - ./vlab/oofs/ext:/app/vlab/oofs/ext
+    restart: unless-stopped
+
+  instance3:
+    container_name: instance3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: tail -f /dev/null
+    ports:
+      - "6082:6080"
+    volumes:
+      - ./vlab/oofs/ext:/app/vlab/oofs/ext
     restart: unless-stopped

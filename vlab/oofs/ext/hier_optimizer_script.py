@@ -1,131 +1,69 @@
 """
-This script checks multiple surrogate models for optimizing plant parameters.
-It reads real plant data, trains an optimizer network for each surrogate model,
-and evaluates the optimized parameters against the real plant data.
-It saves the best parameters and their corresponding cost.
-Supports normal, boundary, and hierarchical surrogate models.
+Optimizer Script for Plant Parameters using Surrogate Models.
+Optimizes input parameters to minimize predicted cost against real plant data.
+Supports both Baseline MLP and Sinkhorn Transformer models.
 """
 
 import os
 import sys
 import torch
 import torch.nn as nn
-import shutil
+import torch.optim as optim
+import argparse
 import csv
-import time as t
-from utils_nn import build_parameter_file, generate_and_evaluate_in_dir, compute_normalization_stats
-from plant_comparison_nn import calculate_cost, read_real_plants
+import time
+import subprocess
+import shutil
+from datetime import datetime
+from plant_comparison_nn import read_real_plants, calculate_cost
+from utils_nn import build_parameter_file
+import surrogate_nn_dataset as baseline_model
+import surrogate_nn_dataset_sinkhorn as sinkhorn_model
 
-# Import all surrogate model types
-try:
-    from surrogate_nn import HierarchicalPlantSurrogateNet
-except ImportError:
-    print("Warning: Could not import HierarchicalPlantSurrogateNet from surrogate_nn")
-    HierarchicalPlantSurrogateNet = None
+# ==========================================
+#              USER CONFIGURATION 
+# ==========================================
 
-# Import PlantSurrogateNet for normal model support
-try:
-    from benchmark1_nn import PlantSurrogateNet
-except ImportError:
-    print("Warning: Could not import PlantSurrogateNet from benchmark_nn")
-    PlantSurrogateNet = None
+# 1. Select Operation Mode
+# Set which paths to use for optimization.
+# You can uncomment or add paths to these lists.
 
-# Customizable variables:
-param_min = torch.tensor([8.0, 2.8, -110.0, -4.0, 125.0, 3.0, 0.48, 0.8, 80.0, 170.0, 0.6, 0.88, 0.48])
-param_max = torch.tensor([12.0, 3.2, 110.0, 4.0, 145.0, 7.0, 0.52, 1.2, 100.0, 190.0, 0.8, 0.92, 0.52])
-weight_decay = 1e-5
-num_restarts = 10
-batch_size = 32
-diversity_amount = 0.1
-accuracy_threshold = 0.01
-boundary_penalty_weight = 0.1   # New: weight for soft boundary penalty
-
-directory = "data/Normal Data/Final/"
-optimizer_directory = "data/Optimizer/"
-
-# Create optimizer directory if it doesn't exist
-if not os.path.exists(optimizer_directory):
-    os.makedirs(optimizer_directory)
-
-surrogate_models = [
-    ["surrogate_model.pt", "hierarchical", HierarchicalPlantSurrogateNet],  # Mutant2 hierarchical model
-    ["benchmark1_batch_surrogate_model.pt", "benchmark1-batch", PlantSurrogateNet],  # Batch-16 normal model
-    ["benchmark2_online_surrogate_model.pt", "benchmark2-online", PlantSurrogateNet],  # Batch-16 normal model
+# Option A: Process entire run folders (finds all best_model.pt inside)
+TARGET_RUN_DIRS = [
+    # "Training Data/Run_030426",
+    # "Training Data/Run_030426_1",
 ]
 
-for i in range(len(surrogate_models)):
-    surrogate_models[i][0] = directory + surrogate_models[i][0]
+# Option B: Process specific model files
+TARGET_MODEL_PATHS = [
+    "Training Data/Run_030426_1/baseline_mlp/best_model.pt",
+    "Training Data/Run_030426_1/sinkhorn_transformer/best_model.pt",
+]
 
-def prepare_real_plant_batch(real_bp, real_ep, max_points=50):
-    """Convert real plant data to fixed-size tensors for hierarchical model"""
-    num_days = len(real_bp)
-    
-    # Initialize tensors
-    bp_batch = torch.zeros(1, num_days, max_points, 2)
-    ep_batch = torch.zeros(1, num_days, max_points, 2)
-    
-    for day in range(num_days):
-        # Branch points
-        bp_day = real_bp[day]
-        if len(bp_day) > 0:
-            bp_array = torch.tensor(bp_day[:max_points], dtype=torch.float32)
-            bp_batch[0, day, :min(len(bp_day), max_points), :] = bp_array
-        
-        # End points
-        ep_day = real_ep[day]
-        if len(ep_day) > 0:
-            ep_array = torch.tensor(ep_day[:max_points], dtype=torch.float32)
-            ep_batch[0, day, :min(len(ep_day), max_points), :] = ep_array
-    
-    return bp_batch, ep_batch
+# 2. Optimization Settings
+OUTPUT_DIR = "Optimizer Data" # Base directory for optimizer runs
+NUM_RESTARTS = 10       # Number of times to restart optimization to avoid local minima
+NUM_STEPS = 1000        # Gradient descent steps per restart
+LEARNING_RATE = 0.01    # Learning rate for the optimizer
 
-def load_surrogate_model(model_path, model_type, model_class):
-    """Load surrogate model based on its type"""
-    if model_class is None:
-        print(f"Model class not available for {model_type}")
-        return None
-        
-    try:
-        if model_type == "hierarchical":
-            model = model_class()
-        else:
-            model = model_class()
-        
-        model.load_state_dict(torch.load(model_path))
-        model.eval()
-        return model
-    except Exception as e:
-        print(f"Error loading {model_path}: {e}")
-        return None
+# 3. Parameter Constraints
+PARAM_MIN = torch.tensor([8.0, 2.8, -110.0, -4.0, 125.0, 3.0, 0.48, 0.8, 80.0, 170.0, 0.6, 0.88, 0.48])
+PARAM_MAX = torch.tensor([12.0, 3.2, 110.0, 4.0, 145.0, 7.0, 0.52, 1.2, 100.0, 190.0, 0.8, 0.92, 0.52])
 
-def evaluate_surrogate_model(surrogate, params_batch, model_type, real_bp_batch=None, real_ep_batch=None):
-    """Evaluate surrogate model based on its type"""
-    try:
-        if model_type == "hierarchical":
-            if real_bp_batch is not None and real_ep_batch is not None:
-                # For hierarchical model, we need real plant data to get proper cost predictions
-                # The model was trained to compare synthetic structures to real plants
-                output = surrogate(params_batch, real_bp_batch, real_ep_batch)
-                # If output is a tuple, extract the cost tensor
-                if isinstance(output, tuple):
-                    cost = output[0]
-                else:
-                    cost = output
-                return cost
-            else:
-                # Fallback: structure complexity approximation (not ideal)
-                with torch.no_grad():
-                    bp_syn, bp_probs, ep_syn, ep_probs = surrogate(params_batch)
-                    structure_complexity = (bp_probs.mean(dim=-1) + ep_probs.mean(dim=-1)).mean(dim=-1, keepdim=True)
-                    return structure_complexity * 100  # Scale to reasonable cost range
-        else:
-            # For normal and boundary models
-            return surrogate(params_batch)
-    except Exception as e:
-        print(f"Error evaluating surrogate model: {e}")
-        return torch.zeros(params_batch.size(0), 1)
+# ==========================================
+
+def get_parser():
+    parser = argparse.ArgumentParser(description="Optimize plant parameters using surrogate models.")
+    parser.add_argument("--run_dir", type=str, help="Path to the training run directory (e.g., Data/Run_030426_1)")
+    parser.add_argument("--model_path", type=str, help="Path to a specific model file (.pt)")
+    parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Directory to save optimization results")
+    parser.add_argument("--restarts", type=int, default=NUM_RESTARTS, help="Number of optimization restarts")
+    parser.add_argument("--steps", type=int, default=NUM_STEPS, help="Number of optimization steps per restart")
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate for optimizer")
+    return parser
 
 class OptimizerNet(nn.Module):
+    """Simple generator network to output optimal parameters"""
     def __init__(self, input_dim=1, output_dim=13):
         super().__init__()
         self.net = nn.Sequential(
@@ -134,222 +72,382 @@ class OptimizerNet(nn.Module):
             nn.Linear(64, 64),
             nn.ReLU(),
             nn.Linear(64, output_dim),
-            nn.Sigmoid()  # constrain to [0,1]
+            nn.Sigmoid() 
         )
-        self.param_min = param_min
-        self.param_max = param_max
+        self.register_buffer('param_min', PARAM_MIN)
+        self.register_buffer('param_max', PARAM_MAX)
 
     def forward(self, x):
         out = self.net(x)
+        # Scale to parameter range
         return out * (self.param_max - self.param_min) + self.param_min
 
-def clear_dir(output_dir):
-    if os.path.exists(output_dir):
-        for file in os.listdir(output_dir):
-            file_path = os.path.join(output_dir, file)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                print(f"Failed to delete {file_path}. Reason: {e}")
+def prepare_real_plant_batch(real_bp, real_ep, max_points=50, device='cpu'):
+    """Convert real plant data to fixed-size tensors"""
+    num_days = len(real_bp)
+    bp_batch = torch.zeros(1, num_days, max_points, 2, device=device)
+    ep_batch = torch.zeros(1, num_days, max_points, 2, device=device)
+    
+    for day in range(num_days):
+        if len(real_bp[day]) > 0:
+            count = min(len(real_bp[day]), max_points)
+            bp_batch[0, day, :count, :] = torch.tensor(real_bp[day][:count], dtype=torch.float32)
+        if len(real_ep[day]) > 0:
+            count = min(len(real_ep[day]), max_points)
+            ep_batch[0, day, :count, :] = torch.tensor(real_ep[day][:count], dtype=torch.float32)
+            
+    return bp_batch, ep_batch
+
+def load_model(model_path):
+    """Detects model type and loads appropriate class"""
+    model_path = os.path.abspath(model_path)
+    # Check absolute path first
+    
+    # Determine type from path or parent folder name
+    parent_folder = os.path.basename(os.path.dirname(model_path))
+    
+    if "sinkhorn" in parent_folder.lower() or "sinkhorn" in model_path.lower():
+        print(f"Loading {os.path.basename(model_path)} (Type: Sinkhorn Transformer)")
+        ModelClass = sinkhorn_model.HierarchicalPlantSurrogateNet
+        model_type = "sinkhorn"
+    elif "baseline" in parent_folder.lower() or "baseline" in model_path.lower():
+        print(f"Loading {os.path.basename(model_path)} (Type: Baseline MLP)")
+        ModelClass = baseline_model.HierarchicalPlantSurrogateNet
+        model_type = "baseline"
     else:
-        os.makedirs(output_dir)
+        # Default fallback
+        print(f"Loading {os.path.basename(model_path)} (Type: Unknown, assuming Baseline MLP)")
+        ModelClass = baseline_model.HierarchicalPlantSurrogateNet
+        model_type = "baseline"
 
-print("Reading real plants...")
-real_bp, real_ep = read_real_plants()
-real_bp_batch, real_ep_batch = prepare_real_plant_batch(real_bp, real_ep)  # For hierarchical model
-
-if len(sys.argv) > 1:
+    model = ModelClass()
     try:
-        num_restarts = int(sys.argv[1])
-    except ValueError:
-        print("Invalid argument for number of restarts, using default 5.")
+        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    except Exception as e:
+        print(f"Error loading state dict for {model_path}: {e}")
+        return None, None
         
-num_runs = 1000
+    model.eval()
+    return model, model_type
 
-# Track the best results across all models
-global_best_cost = float('inf')
-global_best_params = None
-global_best_model = None
 
-# Loop over each surrogate model configuration
-for model_path, model_type, model_class in surrogate_models:
-    if os.path.exists(model_path):
-        print(f"\nProcessing surrogate model: {model_path} (type: {model_type})")
+def read_syn_plant_surrogate(file_name):
+    try:
+        with open(file_name, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"Error reading synthetic plant output: {e}")
+        return [], []
         
-        # Use optimizer directory for optimizer-related files
-        model_basename = os.path.basename(model_path)
-        optimizer_model_path = os.path.join(optimizer_directory, model_basename.replace(".pt", "_optimizer.pt"))
-        csv_file = os.path.join(optimizer_directory, model_basename + ".csv")
+    day_temp = 0
+    syn_bp = []
+    syn_ep = []
+    syn_bp_day = []
+    syn_ep_day = []
+    day = []
+
+    for line in lines:
+        temp = line.split(" ")
+        if len(temp) < 2: continue
         
-        # Always overwrite CSV and write header
-        with open(csv_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["true_cost", "pred_cost"] + [f"param_{i}" for i in range(13)])
-    
-        # Load the surrogate model and set it into eval mode
-        surrogate = load_surrogate_model(model_path, model_type, model_class)
-        if surrogate is None:
-            print(f"Skipping {model_path} - could not load model")
-            continue
-    
-        # Pre-expand real plant data for hierarchical models (needed for proper cost prediction)
-        if model_type == "hierarchical":
-            real_bp_batch_expanded = real_bp_batch.expand(batch_size, -1, -1, -1)
-            real_ep_batch_expanded = real_ep_batch.expand(batch_size, -1, -1, -1)
-        else:
-            real_bp_batch_expanded = None
-            real_ep_batch_expanded = None
-    
-        best_cost = float('inf')
-        best_params = None
-    
-        for restart in range(num_restarts):
-            optimizer_net = OptimizerNet()
-            if os.path.exists(optimizer_model_path) and restart == 0:
-                optimizer_net.load_state_dict(torch.load(optimizer_model_path))
-                print(f"Loaded existing optimizer network from {optimizer_model_path}")
-            else:
-                print(f"Starting optimizer network from scratch (restart {restart+1}/{num_restarts}).")
-    
-            optimizer = torch.optim.Adam(optimizer_net.parameters(), lr=1e-2, weight_decay=weight_decay)
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.8)  # More frequent decay
-            param_noise_std = 0.02
-            
-            # Early stopping variables - more aggressive for hierarchical models
-            best_loss = float('inf')
-            patience = num_runs / 8  # Reduced patience for faster stopping
-            no_improve_count = 0
-
-            for step in range(num_runs):
-                optimizer.zero_grad()
-                noise = torch.rand(batch_size, 1)
-                params = optimizer_net(noise)
-                # Instead of hard clamping:
-                # params_noisy = torch.max(torch.min(params_noisy, param_max), param_min)
-                params_noisy = params + torch.randn_like(params) * param_noise_std
-
-                # Calculate soft penalty for exceeding bounds
-                excess_low = torch.clamp(param_min - params_noisy, min=0)
-                excess_high = torch.clamp(params_noisy - param_max, min=0)
-                boundary_penalty = boundary_penalty_weight * ((excess_low**2).mean() + (excess_high**2).mean())
-
-                # Evaluate surrogate model based on its type
-                if model_type == "hierarchical":
-                    # Hierarchical models need real plant data for proper cost predictions
-                    pred_cost = evaluate_surrogate_model(surrogate, params_noisy, model_type, 
-                                                       real_bp_batch_expanded, real_ep_batch_expanded)
-                else:
-                    pred_cost = evaluate_surrogate_model(surrogate, params_noisy, model_type)
+        if temp[0] == "Day:":
+            try:
+                day_temp = int(temp[1])
+            except ValueError:
+                continue
                 
-                loss = pred_cost.mean()
-                diversity_loss = -params_noisy.var(dim=0).mean()
-                total_loss_val = loss + diversity_amount * diversity_loss + boundary_penalty
+            if day_temp > 2:
+                syn_bp.append(syn_bp_day)
+                syn_ep.append(syn_ep_day)
+                syn_bp_day = []
+                syn_ep_day = []
                 
-                total_loss_val.backward()
-                optimizer.step()
-                scheduler.step()
-                
-                # Early stopping check
-                current_loss = total_loss_val.item()
-                if current_loss < best_loss:
-                    best_loss = current_loss
-                    no_improve_count = 0
-                else:
-                    no_improve_count += 1
-                
-                if no_improve_count >= patience:
-                    print(f"\nEarly stopping at step {step+1} - no improvement for {patience} steps")
-                    break
-                
-                if step % max(1, num_runs // 50) == 0 or step == num_runs - 1:  # More frequent progress updates (every ~20 steps)
-                    percent = 100 * (step + 1) / num_runs
-                    sys.stdout.write(f"\rRestart {restart+1}/{num_restarts} - Progress: {percent:.1f}% - surrogate cost={pred_cost.mean().item():.4f}")
-                    sys.stdout.flush()
-    
-            noise = torch.rand(1, 1)
-            optimized_params_tensor = optimizer_net(noise)
-            optimized_params = optimized_params_tensor.detach().numpy().flatten()
-            print(f"\nOptimized parameters (restart {restart+1}):", optimized_params)
-            # Ensure parameter batch matches real plant batch size for hierarchical model
-            if model_type == "hierarchical":
-                param_batch = optimized_params_tensor.expand(batch_size, -1)
-                pred_cost = evaluate_surrogate_model(
-                    surrogate,
-                    param_batch,
-                    model_type,
-                    real_bp_batch_expanded,
-                    real_ep_batch_expanded
-                )
-            else:
-                pred_cost = evaluate_surrogate_model(
-                    surrogate,
-                    torch.tensor(optimized_params, dtype=torch.float32).unsqueeze(0),
-                    model_type
-                )
-            # Extract scalar predicted cost
-            if isinstance(pred_cost, torch.Tensor):
-                if pred_cost.numel() == 1:
-                    pred_cost_val = float(pred_cost.item())
-                else:
-                    pred_cost_val = float(pred_cost.squeeze().mean().item())
-            elif isinstance(pred_cost, (list, tuple)):
-                # If tuple, try to extract first element and handle tensor inside
-                pc = pred_cost[0]
-                if isinstance(pc, torch.Tensor):
-                    if pc.numel() == 1:
-                        pred_cost_val = float(pc.item())
+        if (temp[0] != "Day:") and (day_temp > 1):
+            if len(temp) >= 4:
+                try:
+                    if temp[0] == "I":
+                        syn_bp_day.append([int(temp[3]), int(temp[2])])
+                        day.append(day_temp)
                     else:
-                        pred_cost_val = float(pc.squeeze().mean().item())
-                else:
-                    pred_cost_val = float(pc)
-            else:
-                pred_cost_val = float(pred_cost)
-            # Evaluate real cost
-            param_file = os.path.join(optimizer_directory, f"temp_params.vset")
-            build_parameter_file(param_file, optimized_params)
-            clear_dir("temp_plant")
-            real_cost = generate_and_evaluate_in_dir(param_file, real_bp, real_ep, "temp_plant", cost_fn=calculate_cost)
-            print(f"Real cost for optimized parameters (restart {restart+1}): {real_cost:.4f}")
-            clear_dir("temp_plant")
-            # Log to CSV: real cost, predicted cost, parameters
-            with open(csv_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([real_cost, pred_cost_val] + list(optimized_params))
+                        syn_ep_day.append([int(temp[3]), int(temp[2])])
+                        day.append(day_temp)
+                except ValueError:
+                    continue
 
-            if real_cost < best_cost:
-                best_cost = real_cost
-                best_params = optimized_params
-                torch.save(optimizer_net.state_dict(), optimizer_model_path)
+    if day_temp == 27:
+        syn_bp.append(syn_bp_day)
+        syn_ep.append(syn_ep_day)
+
+    return syn_bp, syn_ep
+
+def generate_and_evaluate(param_file, real_bp, real_ep):
+    """
+    Runs the actual L-system simulation (lpfg) to generate a plant and calculates the real cost.
+    Requires 'lpfg' and 'project' executables to be in the path or current directory.
+    """
+    output_dir = "data/surrogate"
+    os.makedirs(output_dir, exist_ok=True)
     
-        print(f"\nBest real cost for {model_path}: {best_cost:.4f}")
-        print("Best optimized parameters:", best_params)
-        best_params_file = os.path.join(optimizer_directory, os.path.basename(model_path).replace(".pt", "_optimized_params_best.vset"))
-        build_parameter_file(best_params_file, best_params)
+    # 1. Run LPFG (L-System Generator)
+    # Note: Lsystem files are in 'lsystem/' folder relative to execution root
+    # param_file should be absolute or relative to execution root
+    lpfg_cmd = [
+        "lpfg",
+        "-w", "306", "256",
+        "lsystem/lsystem.l",
+        "lsystem/view.v",
+        "lsystem/materials.mat",
+        "lsystem/contours.cset",
+        "lsystem/functions.fset",
+        "lsystem/functions.tset",
+        param_file
+    ]
+    
+    log_file = os.path.join(output_dir, "lpfg_log.txt")
+    with open(log_file, "w") as f_log:
+        try:
+            subprocess.run(lpfg_cmd, stdout=f_log, stderr=subprocess.STDOUT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"LPFG execution failed. Check if 'lpfg' is installed/reachable. Error: {e}")
+            return float('inf')
+        except FileNotFoundError:
+             print("LPFG executable not found. Please ensure 'lpfg' is in your PATH.")
+             return float('inf')
+
+    # 2. Run Project (Endpoint/Branchpoint Extractor)
+    # Reads 'leafposition.dat' which lpfg generates in current directory
+    if not os.path.exists("project"):
+        print("Compiling project executable...")
+        os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
+    
+    if os.path.exists("leafposition.dat"):
+        output_txt = os.path.join(output_dir, "output.txt")
+        # Ensure 'project' is executable
+        if not os.access("./project", os.X_OK):
+             os.chmod("./project", 0o755)
+             
+        cmd = f"./project 2454 2056 leafposition.dat > {output_txt}"
+        os.system(cmd)
         
-        # Update global best if this model performed better
-        if best_cost < global_best_cost:
-            global_best_cost = best_cost
-            global_best_params = best_params.copy()
-            global_best_model = model_path
+        # Move leafposition.dat to data folder for record keeping
+        shutil.move("leafposition.dat", os.path.join(output_dir, "leafposition.dat"))
+        
+        # 3. Read Output and Calculate Cost
+        syn_bp, syn_ep = read_syn_plant_surrogate(output_txt)
+        
+        total_cost = 0.0
+        # Determine strictness of comparison (min length of both)
+        num_days = min(len(syn_bp), len(real_bp))
+        
+        if num_days == 0:
+            return float('inf') # Failed generation
             
+        for i in range(num_days):
+            # calculate_cost takes (day_syn_bp, day_syn_ep, real_bp, real_ep)
+            # Note: syn_bp[i] contains points for day i
+            total_cost += calculate_cost(syn_bp[i], syn_ep[i], real_bp[i], real_ep[i])
+            
+        return total_cost
+        
     else:
-        print(f"Surrogate model not found: {model_path}")
+        print("Error: leafposition.dat was not generated by lpfg.")
+        return float('inf')
 
-# Print overall best results across all models
-print(f"\n{'='*60}")
-print("OVERALL BEST RESULTS ACROSS ALL MODELS:")
-print(f"{'='*60}")
-if global_best_model is not None:
-    print(f"Best model: {global_best_model}")
-    print(f"Best real cost: {global_best_cost:.4f}")
-    print("Best optimized parameters:", global_best_params)
+def optimize_for_model(model, model_type, real_bp_batch, real_ep_batch, restarts, steps, lr, real_bp, real_ep):
+    """Runs the optimization loop for a single model"""
     
-    # Save the overall best parameters
-    overall_best_file = os.path.join(optimizer_directory, "overall_best_optimized_params.vset")
-    build_parameter_file(overall_best_file, global_best_params)
-    print(f"Overall best parameters saved to: {overall_best_file}")
-else:
-    print("No models were successfully processed.")
+    best_cost = float('inf')
+    best_params = None
+    best_real_cost = float('inf')
+    
+    print(f"Starting optimization ({restarts} restarts, {steps} steps)...")
+    
+    for restart in range(restarts):
+        # Initialize Optimizer Network
+        opt_net = OptimizerNet()
+        optimizer = optim.Adam(opt_net.parameters(), lr=lr)
+        
+        # Batch of inputs for the optimizer net (can be just constant 1s or noise)
+        dummy_input = torch.randn(1, 1) 
+        
+        # start_time = time.time()
+        
+        for step in range(steps):
+            optimizer.zero_grad()
+            
+            # 1. Generate Parameters
+            pred_params = opt_net(dummy_input)
+            
+            # 2. Evaluate Cost using Surrogate
+            if model_type == "sinkhorn":
+                # Sinkhorn model might return (assignment, cost) or just cost depending on implementation
+                # Based on previous file read, it returns denormalized cost directly in forward()
+                predicted_cost = model(pred_params, real_bp_batch, real_ep_batch)
+            else:
+                predicted_cost = model(pred_params, real_bp_batch, real_ep_batch)
+            
+            # 3. Loss = Minimize Cost
+            loss = predicted_cost.mean()
+            
+            loss.backward()
+            optimizer.step()
+            
+        # Check result of this restart
+        with torch.no_grad():
+            final_params = opt_net(dummy_input)
+            final_cost = model(final_params, real_bp_batch, real_ep_batch).item()
+            
+            # Convert tensors to list for file writing
+            params_list = final_params.squeeze().tolist()
+            
+            # Verify with Real L-System Simulation
+            print(f"  Restart {restart+1}: Surrogate Cost {final_cost:.4f}. Verifying with LPFG...")
+            temp_param_file = f"temp_opt_params_{restart}.vset"
+            build_parameter_file(temp_param_file, params_list)
+            
+            try:
+                # generate_and_evaluate needs to run lpfg which produces leafposition.dat
+                # We need to be careful about file collisions if running multiple optimizations, 
+                # but here we are sequential.
+                real_sim_cost = generate_and_evaluate(temp_param_file, real_bp, real_ep)
+                print(f"  -> Real L-System Cost: {real_sim_cost:.4f}")
+            except Exception as e:
+                print(f"  -> Simulation Failed: {e}")
+                real_sim_cost = float('inf')
+            
+            # Cleanup temp file
+            if os.path.exists(temp_param_file):
+                os.remove(temp_param_file)
+
+            # We track best based on SURROGATE cost (since that's what we optimized)
+            # But the user can inspect Real Cost to validate the surrogate.
+            # Alternatively, we could save the best *Real* cost, but that defeats the purpose of the surrogate 
+            # if we are just doing random restarts and checking real cost. 
+            # The surrogate guides the gradient descent. 
+            
+            if final_cost < best_cost:
+                best_cost = final_cost
+                best_params = params_list
+                best_real_cost = real_sim_cost
+                print(f"  ** New Best Surrogate Cost found! **")
+
+    return best_params, best_cost, best_real_cost
+
+def main():
+    # Helper: Ensure LPFG is in PATH
+    lpfg_path = os.path.expanduser("~/PhytomorphicNN/vlab/bin")
+    if lpfg_path not in os.environ["PATH"]:
+        os.environ["PATH"] += os.pathsep + lpfg_path
+        
+    parser = get_parser()
+    args = parser.parse_args()
+    
+    # 1. Load Real Plant Data
+    print("Reading real plant structure...")
+    real_bp, real_ep = read_real_plants()
+    real_bp_batch, real_ep_batch = prepare_real_plant_batch(real_bp, real_ep)
+    
+    # 2. Gather Models to Process (Combine CLI args and Config)
+    models_to_process = []
+    
+    # Configuration lists
+    run_dirs = list(TARGET_RUN_DIRS)
+    model_paths = list(TARGET_MODEL_PATHS)
+    
+    # Args override or append? Let's treat them as additional inputs
+    if args.run_dir:
+        run_dirs.append(args.run_dir)
+    if args.model_path:
+        model_paths.append(args.model_path)
+        
+    # Process Directories
+    for run_dir in run_dirs:
+        if os.path.exists(run_dir):
+            for root, dirs, files in os.walk(run_dir):
+                if "best_model.pt" in files:
+                    models_to_process.append(os.path.join(root, "best_model.pt"))
+        else:
+            print(f"Warning: Run directory {run_dir} not found.")
+
+    # Process Individual Files
+    for mp in model_paths:
+        if os.path.exists(mp):
+            if mp not in models_to_process:
+                models_to_process.append(mp)
+        else:
+            print(f"Warning: Model file {mp} not found.")
+            
+    # Remove duplicates
+    models_to_process = list(set(models_to_process))
+
+    if not models_to_process:
+        print("No models found to process. Please check USER CONFIGURATION or command line arguments.")
+        parser.print_help()
+        return
+
+    # 3. Process Each Model
+    
+    # Determine output directory
+    if args.output_dir == OUTPUT_DIR:
+        # Default behavior: create a new timestamped run folder
+        date_str = datetime.now().strftime("%m%d%y")
+        run_base_name = f"Run_{date_str}"
+        output_dir = os.path.join(OUTPUT_DIR, run_base_name)
+        
+        # Incremental naming to avoid collision
+        if os.path.exists(output_dir):
+            i = 1
+            while os.path.exists(f"{output_dir}_{i}"):
+                i += 1
+            output_dir = f"{output_dir}_{i}"
+    else:
+        # User specified directory
+        output_dir = args.output_dir
+        
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Saving optimizer results to: {output_dir}")
+    
+    print(f"\nFound {len(models_to_process)} models to optimize.")
+    
+    for model_path in models_to_process:
+        print("\n" + "=" * 60)
+        model, model_type = load_model(model_path)
+        if model is None:
+            continue
+            
+        restarts = args.restarts if args.restarts != 10 else NUM_RESTARTS
+        steps = args.steps if args.steps != 1000 else NUM_STEPS
+        lr = args.lr if args.lr != 0.01 else LEARNING_RATE
+            
+        best_params, best_surrogate_cost, best_real_cost = optimize_for_model(
+            model, model_type, real_bp_batch, real_ep_batch, restarts, steps, lr,
+            real_bp, real_ep
+        )
+        
+        if best_params is not None:
+            # Save Results
+            model_name = os.path.basename(os.path.dirname(model_path)) # e.g. baseline_mlp
+            # run_name is used in filename to identify source model run, not output run
+            run_name = os.path.basename(os.path.dirname(os.path.dirname(model_path))) # e.g. Run_030426
+            
+            output_csv = os.path.join(output_dir, f"optimized_{run_name}_{model_name}.csv")
+            
+            with open(output_csv, "w", newline="") as f:
+                writer = csv.writer(f)
+                header = ["predicted_min_cost", "real_sim_cost"] + [f"param_{i}" for i in range(len(best_params))]
+                writer.writerow(header)
+                row = [best_surrogate_cost, best_real_cost] + list(best_params)
+                writer.writerow(row)
+                
+            print(f"Optimization Complete for {model_name}.")
+            print(f"  Predicted Cost: {best_surrogate_cost:.4f}")
+            print(f"  Real Simulation Cost: {best_real_cost:.4f}")
+            print(f"Results saved to: {output_csv}")
+            # print(f"Best Parameters: {best_params}")
+        
+    print("\n" + "=" * 60)
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
+

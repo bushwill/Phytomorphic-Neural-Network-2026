@@ -1,0 +1,3 @@
+Model: sinkhorn_transformer
+Date: 030426
+Test Loss: 177843073843.2000

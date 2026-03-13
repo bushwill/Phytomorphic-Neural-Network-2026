@@ -1,32 +1,35 @@
 #!/bin/bash
 
-# System package installation
-apt-get update && apt-get install -y sudo
+# VLAB Setup Script
+# Assumes system dependencies are installed via Dockerfile
 
-sudo apt-get update && \
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common && \
-sudo add-apt-repository -y universe && \
-sudo apt-get install -y qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools build-essential xvfb freeglut3-dev libglm-dev
-sudo apt-get install -y python3 python3-pip python3-numpy python3-pandas python3-skimage python3-munkres
-sudo pip3 install --break-system-packages skan torch
-
-ln -s /usr/lib/x86_64-linux-gnu/libglut.so.3.12 /usr/lib/x86_64-linux-gnu/libglut.so.3
-
-# Initialize virtual display for vlab
-Xvfb :99 -screen 0 1280x1024x24 &
+# Initialize virtual display for vlab (if not already running)
+if ! pgrep Xvfb >/dev/null; then
+    echo "Starting Xvfb..."
+    # Check if we can write to /tmp/.X11-unix, if not try to use a local one
+    Xvfb :99 -screen 0 1280x1024x24 &
+    sleep 2 # Give it a moment to start
+fi
 export DISPLAY=:99
 export XDG_RUNTIME_DIR=/tmp/runtime-root
 
 # VLAB Installation following official instructions
 echo "=== VLAB Installation Process ==="
 
-# Step 1: Installing the distribution (already done via Dockerfile)
-echo "Step 1: Distribution already extracted to /app/vlab-5.0"
+# Step 1: Installing the distribution (already done via Dockerfile copy)
+echo "Step 1: Distribution should be at /app/vlab"
+
+if [ ! -d "/app/vlab" ]; then
+    echo "ERROR: /app/vlab directory not found. Did the Docker COPY fail?"
+    return 1
+fi
 
 # Change to vlab directory for Step 1d
-cd /app/vlab
+cd /app/vlab || return
 
 echo "Step 1d: Running postinstall.sh..."
+# Check permission/executable
+chmod +x bin/postinstall.sh
 ./bin/postinstall.sh
 
 # Step 2 & 3: Set up VLAB environment directly 
@@ -65,3 +68,5 @@ fi
 
 echo "=== VLAB Installation Complete ==="
 echo "You can now run VLAB commands like: browser, lpfg, cpfg, vlab-splash"
+
+cd /app/vlab/oofs/ext || return

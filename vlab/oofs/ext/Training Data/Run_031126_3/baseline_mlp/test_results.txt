@@ -1,0 +1,16 @@
+Model: baseline_mlp
+Date: 031126
+Dataset: Run 030926
+Split Sizes: Train=1000, Val=100, Test=300
+Target Cost Mean: 151349.0938
+Target Cost Std: 94656.8672
+=== Test Results ===
+Test Norm Loss (MSE): 0.7150
+Test Real MSE: 6406274048.0000
+Test Real MAE: 52370.5938
+Implied Real RMSE (from Norm Loss): 80039.1987
+Test R2 Score: 0.1941
+Mean Relative Error: 0.4019
+Median Relative Error: 0.3068
+Accuracy (<1% error): 1.00%
+Accuracy (<5% error): 9.00%

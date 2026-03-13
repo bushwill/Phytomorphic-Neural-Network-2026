@@ -1,0 +1,30 @@
+Training Run: Run_030426_1
+Date: 2026-03-04 20:57:51
+Dataset Source: Run 030426
+Dataset Path: /app/vlab/oofs/ext/Datasets/Run 030426
+
+=== Dataset Statistics (Normalization) ===
+Number of training samples: 1000
+Input Parameters Mean:
+[ 1.0502000e+01  5.0500312e+00 -3.3911134e-03  8.9999252e+01
+  1.3499944e+02  5.0500307e+00  5.0501233e-01  1.0049968e+00
+  8.9998268e+01  1.7999893e+02  9.9998707e-01  1.0050256e+00
+  4.9999788e-01]
+Input Parameters Std:
+[  5.4999995    2.857919   103.92004     51.96186     77.94061
+   2.857875     0.2858234    0.5744809   51.963127   103.92457
+   0.5773572    0.57448214   0.28866902]
+Cost Mean: 152157.406250
+Cost Std: 90956.609375
+
+=== Models Configuration ===
+Model: baseline_mlp
+  Batch Size: 32
+  Learning Rate: 0.0001
+  Epochs: 10
+------------------------------
+Model: sinkhorn_transformer
+  Batch Size: 32
+  Learning Rate: 0.0001
+  Epochs: 10
+------------------------------
