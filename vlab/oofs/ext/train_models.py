@@ -16,37 +16,54 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
 # --- Import Model Architectures ---
-# Each module should provide: PlantDataset, HierarchicalPlantSurrogateNet, hierarchical_loss_function
-import surrogate_nn_dataset as baseline_model
-import surrogate_nn_dataset_sinkhorn as sinkhorn_model
-import surrogate_nn_dataset_scheduler as baseline_model_scheduler
-import surrogate_nn_dataset_sinkhorn_scheduler as sinkhorn_model_scheduler
-from plant_comparison_nn import read_real_plants
+# Each module should provide: PlantDataset, HierarchicalPlantSurrogateNet (or similar), hierarchical_loss_function
+import model_hungarian
+import model_sinkhorn
+import model_mlp
+import utils_nn as plant_comparison_nn
+from utils_nn import read_real_plants
 
-# --- CONFIGURATION ---
-DEFAULT_DATASET = "Run 031026"
+# --- USER CONFIGURATION ---
+# Dataset Settings
+DATASET_NAME = "Run 021926"  # Dataset folder in Datasets/
+PLANT_NAME = "Plant_063-32"  # Real plant to compare against for training
+NUM_REPLICATES = 3           # Number of replicate runs per model
+NUM_EPOCHS = 10              # Training epochs
+BATCH_SIZE = 32              # Batch size for training (Optimized via Tuning for Sinkhorn)
+LEARNING_RATE = 5e-4         # Initial learning rate (Optimized via Tuning for Sinkhorn)
+USE_MULTIPROCESSING = True   # Enable multiprocessing for data loading
 
 # Define the models to be trained in this session
 MODELS_TO_TRAIN = [
     {
-        "name": "baseline_mlp_scheduler",
-        "dataset_class": baseline_model_scheduler.PlantDataset,
-        "model_class": baseline_model_scheduler.HierarchicalPlantSurrogateNet,
-        "loss_fn": baseline_model_scheduler.hierarchical_loss_function,
-        "batch_size": 32,
-        "learning_rate": 1e-4,
-        "epochs": 10,
-        "module": baseline_model_scheduler  # Used to access get_scheduler
+        "name": "baseline",
+        "dataset_class": model_mlp.PlantDataset,
+        "model_class": model_mlp.BenchmarkSurrogateNet,
+        "loss_fn": model_mlp.benchmark_loss_function,  
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_mlp 
     },
     {
-        "name": "sinkhorn_scheduler",
-        "dataset_class": sinkhorn_model_scheduler.PlantDataset,
-        "model_class": sinkhorn_model_scheduler.HierarchicalPlantSurrogateNet,
-        "loss_fn": sinkhorn_model_scheduler.hierarchical_loss_function,
-        "batch_size": 32,
-        "learning_rate": 1e-4,
-        "epochs": 10,
-        "module": sinkhorn_model_scheduler
+        "name": "hungarian",
+        "dataset_class": model_hungarian.PlantDataset,
+        "model_class": model_hungarian.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_hungarian.hierarchical_loss_function,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_hungarian
+    },
+    {
+        "name": "sinkhorn",
+        "dataset_class": model_sinkhorn.PlantDataset,
+        "model_class": model_sinkhorn.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_sinkhorn.hierarchical_loss_function,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_sinkhorn
     }
 ]
 
@@ -56,12 +73,14 @@ os.umask(0)
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train plant surrogate models.")
-    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET, 
-                        help=f"Name of the dataset folder in Datasets/ (default: '{DEFAULT_DATASET}')")
-    parser.add_argument("--replicates", type=int, default=1, 
-                        help="Number of replicates to run for each model configuration (default: 1)")
-    parser.add_argument("--no-multiprocessing", action="store_true", 
-                        help="Disable multiprocessing (run sequentially)")
+    parser.add_argument("--dataset", type=str, default=DATASET_NAME, 
+                        help=f"Name of the dataset folder in Datasets/ (default: '{DATASET_NAME}')")
+    parser.add_argument("--plant", type=str, default=PLANT_NAME,
+                        help=f"Name of the real plant to use (default: '{PLANT_NAME}')")
+    parser.add_argument("--replicates", type=int, default=NUM_REPLICATES, 
+                        help=f"Number of replicates to run for each model configuration (default: {NUM_REPLICATES})")
+    parser.add_argument("--no-multiprocessing", action="store_true", default=not USE_MULTIPROCESSING, 
+                        help=f"Disable multiprocessing (default: {not USE_MULTIPROCESSING})")
     return parser.parse_known_args()[0]
 
 # --- UTILS ---
@@ -136,7 +155,7 @@ def train_one_epoch(model, loader, optimizer, real_bp_batch, real_ep_batch,
 
         # 5. Calculate Loss
         loss, _, _, _ = loss_fn(
-            pred_cost_norm, norm_costs, bp_syn, bp_probs, ep_syn, ep_probs, real_bp_raw, real_ep_raw
+            pred_cost_norm, norm_costs, bp_syn, bp_probs, ep_syn, ep_probs, params, real_bp_raw, real_ep_raw
         )
              
         # Sinkhorn Specific: Clamp temperature to prevent numerical instability
@@ -228,9 +247,16 @@ def train_model_worker(config, run_dir, input_mean, input_std, output_mean, outp
     Worker function to train a single model replicate.
     Designed to run in a separate process.
     """
+
+    current_seed = 42 + replicate_id
+    torch.manual_seed(current_seed)
+    np.random.seed(current_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(current_seed)
+
     model_base_name = config["name"]
     unique_run_name = f"{model_base_name}_Rep_{replicate_id}"
-    print(f"\n[Worker] Starting {unique_run_name}...")
+    print(f"\n[Worker] Starting {unique_run_name} (Seed: {current_seed})...")
     
     # Re-instantiate Datasets inside worker (avoid pickling issues with DataLoaders)
     PlantDataset = config["dataset_class"]
@@ -402,6 +428,13 @@ def aggregate_results(run_dir):
 
 def main():
     args = parse_arguments()
+    
+    # Configure Plant
+    plant_comparison_nn.real_plant_name = args.plant
+    if not plant_comparison_nn.plant_images_path.endswith(os.sep):
+        plant_comparison_nn.plant_images_path += os.sep
+    plant_comparison_nn.plant_image_path = plant_comparison_nn.plant_images_path + args.plant
+    
     dataset_run = args.dataset
     replicates_count = args.replicates
     use_multi = not args.no_multiprocessing
@@ -432,14 +465,14 @@ def main():
     # Load Data & Stats
     print("Loading Real Plants...")
     real_bp, real_ep = read_real_plants()
-    real_bp_batch, real_ep_batch = prepare_real_plant_batch(real_bp, real_ep, use_multi)
+    real_bp_batch, real_ep_batch = prepare_real_plant_batch(real_bp, real_ep, use_multiprocessing=use_multi)
     
     train_csv = os.path.join(datasets_dir, "Train.csv")
     val_csv = os.path.join(datasets_dir, "Validation.csv")
     test_csv = os.path.join(datasets_dir, "Test.csv")
     
     # Calculate Stats for Normalization (Using Baseline class as helper)
-    ds_temp = baseline_model.PlantDataset(train_csv)
+    ds_temp = model_hungarian.PlantDataset(train_csv)
     input_mean = ds_temp.params.mean(axis=0)
     input_std = ds_temp.params.std(axis=0) + 1e-8
     output_mean = ds_temp.costs.mean()
@@ -447,9 +480,30 @@ def main():
     
     # Save Description
     with open(os.path.join(run_output_dir, "description.txt"), "w") as f:
-        f.write(f"Run: {candidate}\nDataset: {dataset_run}\n")
-        f.write(f"Stats - Input Mean: {input_mean[:3]}...\n") # Abbreviated
-        f.write(f"Stats - Cost Mean: {output_mean:.2f}, Std: {output_std:.2f}\n")
+        f.write(f"Run ID: {candidate}\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Dataset: {dataset_run}\n")
+        f.write(f"Ref Plant: {args.plant}\n")
+        f.write("========================================\n")
+        f.write("Configuration:\n")
+        f.write(f"  Replicates: {replicates_count}\n")
+        f.write(f"  Epochs: {NUM_EPOCHS}\n")
+        f.write(f"  Batch Size: {BATCH_SIZE}\n")
+        f.write(f"  Learning Rate: {LEARNING_RATE}\n")
+        f.write("========================================\n")
+        f.write("Statistics (Normalization):\n")
+        # Ensure full numpy arrays are printed
+        np_print_opts = np.get_printoptions()
+        np.set_printoptions(threshold=np.inf, linewidth=np.inf)
+        f.write(f"  Input Mean: {input_mean}\n")
+        f.write(f"  Input Std:  {input_std}\n")
+        np.set_printoptions(**np_print_opts) # Restore options
+        f.write(f"  Cost Mean:  {output_mean:.6f}\n")
+        f.write(f"  Cost Std:   {output_std:.6f}\n")
+        f.write("========================================\n")
+        f.write("Models:\n")
+        for m in MODELS_TO_TRAIN:
+            f.write(f"  - {m['name']} (Loss: {m['loss_fn'].__name__})\n")
         
     # Launch Workers
     train_ds_args = (train_csv, None)

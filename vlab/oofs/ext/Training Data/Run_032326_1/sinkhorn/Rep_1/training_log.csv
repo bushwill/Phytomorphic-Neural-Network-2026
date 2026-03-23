@@ -1,0 +1,5 @@
+epoch,batch,train_loss,val_loss,val_mae,val_rel_err,val_rel_err_median,val_r2,val_acc_1pct,val_acc_5pct,time_sec
+1,1,4.859610,,,,
+1,10,4.091389,,,,
+1,20,3.610203,,,,
+1,30,3.495894,,,,

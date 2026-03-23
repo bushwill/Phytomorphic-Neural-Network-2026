@@ -1,0 +1,11 @@
+Model: baseline_mlp_scheduler (Replicate 3)
+Date: 2026-03-17
+=== Test Results ===
+Test Norm Loss (MSE): 0.1283
+Test Real MSE: 1196749824.0000
+Test R2 Score: 0.8654
+Mean Relative Error: 0.1636
+Median Relative Error: 0.1102
+Accuracy (<1% error): 4.63%
+Accuracy (<5% error): 22.70%
+Total Training Duration: 57771.09s

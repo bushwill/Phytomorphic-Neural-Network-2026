@@ -1,0 +1,21 @@
+Run ID: Run_032326_1
+Date: 2026-03-23 20:21:28
+Dataset: Run 021926
+Ref Plant: Plant_063-32
+========================================
+Configuration:
+  Replicates: 3
+  Epochs: 10
+  Batch Size: 32
+  Learning Rate: 0.0005
+========================================
+Statistics (Normalization):
+  Input Mean: [1.0500004e+01 5.0500011e+00 6.7647299e-08 9.0000000e+01 1.3500005e+02 5.0499997e+00 5.0500000e-01 1.0050002e+00 8.9999992e+01 1.8000000e+02 1.0000000e+00 1.0049999e+00 5.0000006e-01]
+  Input Std:  [  5.5000043    2.857884   103.92304     51.961525    77.94228      2.8578837    0.2857884    0.5744635   51.96153    103.92304      0.57735026   0.5744635    0.28867516]
+  Cost Mean:  151859.156250
+  Cost Std:   94703.085938
+========================================
+Models:
+  - baseline (Loss: benchmark_loss_function)
+  - hungarian (Loss: hierarchical_loss_function)
+  - sinkhorn (Loss: hierarchical_loss_function)

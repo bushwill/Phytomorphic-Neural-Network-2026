@@ -1,0 +1,11 @@
+Model: sinkhorn (Replicate 2)
+Date: 2026-03-17
+=== Test Results ===
+Test Norm Loss (MSE): 0.1698
+Test Real MSE: 1583646208.0000
+Test R2 Score: 0.8219
+Mean Relative Error: 0.1774
+Median Relative Error: 0.1198
+Accuracy (<1% error): 4.33%
+Accuracy (<5% error): 22.47%
+Total Training Duration: 56297.30s

@@ -1,0 +1,4 @@
+Run: Run_031626
+Dataset: Run 031326
+Stats - Input Mean: [1.0500200e+01 5.0500026e+00 9.6557618e-05]...
+Stats - Cost Mean: 152460.91, Std: 96577.98

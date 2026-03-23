@@ -21,18 +21,27 @@ from scipy.stats import qmc, norm
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from plant_comparison_nn import read_real_plants, calculate_cost, plant_images_path
-    import plant_comparison_nn
-    from utils_nn import generate_plant, read_syn_plant, build_parameter_file
+    from utils_nn import read_real_plants, calculate_cost, plant_images_path, generate_plant, read_syn_plant, build_parameter_file
+    import utils_nn as plant_comparison_nn
 except ImportError:
     print("Error: Could not import project modules. Ensure they are in the python path.")
     sys.exit(1)
 
-# --- Configuration ---
-DEFAULT_PLANT = "Plant_063-32"
-DEFAULT_TRAIN_SIZE = 10000
-DEFAULT_VAL_SIZE = 100
-DEFAULT_TEST_SIZE = 3000
+# --- USER CONFIGURATION ---
+# Dataset Generation Parameters
+PLANT_NAME = "Plant_063-32"   # Target real plant name
+TRAIN_SIZE = 10000            # Number of training samples
+VAL_SIZE = 100                # Number of validation samples
+TEST_SIZE = 3000              # Number of test samples
+BASE_OUTPUT_DIR = "Datasets"  # Base directory for generated datasets
+SAMPLING_METHOD = "lhs"       # Sampling method: "lhs" or "random"
+
+# --- END USER CONFIGURATION ---
+
+DEFAULT_PLANT = PLANT_NAME
+DEFAULT_TRAIN_SIZE = TRAIN_SIZE
+DEFAULT_VAL_SIZE = VAL_SIZE
+DEFAULT_TEST_SIZE = TEST_SIZE
 
 # Param Ranges (Min, Max)
 # Based on usage in lsystem/lsystem.pnl
@@ -200,7 +209,7 @@ def main():
     parser.add_argument("--val_size", type=int, default=DEFAULT_VAL_SIZE)
     parser.add_argument("--test_size", type=int, default=DEFAULT_TEST_SIZE)
     parser.add_argument("--output_dir", default=None, help="Base output directory")
-    parser.add_argument("--method", choices=["lhs", "random"], default="lhs", help="Sampling method")
+    parser.add_argument("--method", choices=["lhs", "random"], default=SAMPLING_METHOD, help="Sampling method")
     args = parser.parse_args()
     
     # 0. Setup Directories
@@ -209,10 +218,10 @@ def main():
         date_str = datetime.now().strftime("%m%d%y")
         candidate = f"Run_{date_str}"
         counter = 0
-        while os.path.exists(os.path.join("Datasets", candidate)):
+        while os.path.exists(os.path.join(BASE_OUTPUT_DIR, candidate)):
             counter += 1
             candidate = f"Run_{date_str}_{counter}"
-        base_dir = os.path.join("Datasets", candidate)
+        base_dir = os.path.join(BASE_OUTPUT_DIR, candidate)
         
     os.makedirs(base_dir, exist_ok=True)
     setup_logging(os.path.join(base_dir, "generation_log.txt"))

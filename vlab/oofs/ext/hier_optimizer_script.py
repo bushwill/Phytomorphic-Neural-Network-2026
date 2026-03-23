@@ -22,10 +22,10 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from plant_comparison_nn import read_real_plants, calculate_cost
-    from utils_nn import build_parameter_file, read_syn_plant
-    import surrogate_nn_dataset as baseline_model
-    import surrogate_nn_dataset_sinkhorn as sinkhorn_model
+    from utils_nn import read_real_plants, calculate_cost, build_parameter_file, read_syn_plant
+    import model_mlp as benchmark_model
+    import model_hungarian as baseline_model
+    import model_sinkhorn as sinkhorn_model
 except ImportError:
     print("Error: Could not import project modules. Ensure they are in the python path.")
     sys.exit(1)
@@ -94,22 +94,39 @@ def prepare_real_plant_batch(real_bp, real_ep, max_points=50, device='cpu'):
 def load_model(model_path):
     """Loads a surrogate model from a .pt file."""
     path_str = str(model_path)
-    model_name = os.path.basename(path_str)
+    model_name = os.path.basename(path_str).lower()
     
-    # Simple heuristic to determine model architecture
-    if "sinkhorn" in path_str.lower():
-        logging.info(f"Loading {model_name} (Type: Sinkhorn Transformer)")
+    ModelClass = None
+    model_type = "unknown"
+
+    # Identify by filename
+    if "sinkhorn" in model_name:
+        logging.info(f"Loading {model_name} (Type: Sinkhorn Hierarchical)")
         ModelClass = sinkhorn_model.HierarchicalPlantSurrogateNet
         model_type = "sinkhorn"
-    else:
-        logging.info(f"Loading {model_name} (Type: Baseline MLP)")
+    elif "mlp" in model_name or "benchmark" in model_name:
+        logging.info(f"Loading {model_name} (Type: Benchmark MLP)")
+        ModelClass = benchmark_model.BenchmarkSurrogateNet
+        model_type = "mlp"
+    elif "hungarian" in model_name or "baseline" in model_name or "scheduler" in model_name: # Scheduler implies hierarchical usually
+        logging.info(f"Loading {model_name} (Type: Hungarian Hierarchical)")
         ModelClass = baseline_model.HierarchicalPlantSurrogateNet
-        model_type = "baseline"
+        model_type = "hungarian"
+    else:
+        # Fallback default if unsure, or error
+        logging.warning(f"Unknown model type for {model_name}. Assuming Hungarian Hierarchical.")
+        ModelClass = baseline_model.HierarchicalPlantSurrogateNet
+        model_type = "hungarian"
+
+    if ModelClass is None:
+        logging.error(f"Could not determine model class for {model_name}")
+        return None, None
 
     model = ModelClass()
     try:
         # Load weights
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+        state_dict = torch.load(model_path, map_location='cpu')
+        model.load_state_dict(state_dict)
         model.eval()
         return model, model_type
     except Exception as e:
@@ -192,10 +209,7 @@ def optimize_model(model, model_type, real_bp_batch, real_ep_batch, args):
             
             # Predict Cost
             # Note: Surrogate models expect (params, real_bp, real_ep)
-            if model_type == "sinkhorn":
-                pred_cost = model(pred_params, real_bp_batch, real_ep_batch)
-            else:
-                pred_cost = model(pred_params, real_bp_batch, real_ep_batch)
+            pred_cost = model(pred_params, real_bp_batch, real_ep_batch)
                 
             loss = pred_cost.mean()
             loss.backward()

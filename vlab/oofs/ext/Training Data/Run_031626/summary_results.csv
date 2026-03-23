@@ -1,0 +1,13 @@
+Model Name,Replicate,Test R2 Score,Test Real MSE,Test Norm Loss (MSE),Mean Relative Error,Accuracy (<1% error),Total Training Duration,Accuracy (<5% error),Date,Median Relative Error,Model
+baseline_mlp,1,0.8616,1230443904.0,0.1319,0.1728,5.6,60621.15,26.1,2026-03-17,0.1088,baseline_mlp (Replicate 1)
+baseline_mlp,2,0.8616,1230443904.0,0.1319,0.1728,5.6,60622.68,26.1,2026-03-17,0.1088,baseline_mlp (Replicate 2)
+baseline_mlp,3,0.8616,1230443904.0,0.1319,0.1728,5.6,60617.6,26.1,2026-03-17,0.1088,baseline_mlp (Replicate 3)
+baseline_mlp_scheduler,1,0.8654,1196749824.0,0.1283,0.1636,4.63,57771.45,22.7,2026-03-17,0.1102,baseline_mlp_scheduler (Replicate 1)
+baseline_mlp_scheduler,2,0.8654,1196749824.0,0.1283,0.1636,4.63,57772.07,22.7,2026-03-17,0.1102,baseline_mlp_scheduler (Replicate 2)
+baseline_mlp_scheduler,3,0.8654,1196749824.0,0.1283,0.1636,4.63,57771.09,22.7,2026-03-17,0.1102,baseline_mlp_scheduler (Replicate 3)
+sinkhorn,1,0.8219,1583646208.0,0.1698,0.1774,4.33,56298.17,22.47,2026-03-17,0.1198,sinkhorn (Replicate 1)
+sinkhorn,2,0.8219,1583646208.0,0.1698,0.1774,4.33,56297.3,22.47,2026-03-17,0.1198,sinkhorn (Replicate 2)
+sinkhorn,3,0.8219,1583646208.0,0.1698,0.1774,4.33,56301.96,22.47,2026-03-17,0.1198,sinkhorn (Replicate 3)
+sinkhorn_scheduler,1,0.9211,701199488.0,0.0752,0.1259,6.47,52870.58,30.97,2026-03-17,0.087,sinkhorn_scheduler (Replicate 1)
+sinkhorn_scheduler,2,0.9211,701199488.0,0.0752,0.1259,6.47,52864.86,30.97,2026-03-17,0.087,sinkhorn_scheduler (Replicate 2)
+sinkhorn_scheduler,3,0.9211,701199488.0,0.0752,0.1259,6.47,52863.97,30.97,2026-03-17,0.087,sinkhorn_scheduler (Replicate 3)
