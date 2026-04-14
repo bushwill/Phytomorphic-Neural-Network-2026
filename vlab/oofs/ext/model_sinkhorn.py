@@ -1,9 +1,16 @@
 """
 Hierarchical Surrogate Neural Network (Sinkhorn + Scheduler).
-Decomposes the problem into:
-1. Structure Generation: Generates synthetic plant structure from L-system params.
-2. Sinkhorn Assignment: Differentiable optimal transport to compare structures.
-3. Cost Aggregation: Aggregates daily comparison costs.
+
+Input: Plant Growth Parameters (13 params)
+Output: Predicted Structural Difference (Cost) vs Real Plant
+
+Architecture Decomposed:
+1. Structure Generation: Generates synthetic point clouds from parameters.
+2. Sinkhorn Assignment: Differentiable comparison between Synthetic and Real point clouds.
+   - Computes soft assignment matrix (Probabilities)
+   - Computes physical distance matrix (Geometry)
+   - Combines them for a differentiable loss.
+3. Cost Aggregation: Aggregates daily costs into final metric.
 """
 
 import torch
@@ -28,7 +35,7 @@ class PlantDataset(Dataset):
     def __init__(self, csv_file, root_dir=None):
         self.data = pd.read_csv(csv_file)
         self.root_dir = root_dir
-        # Assuming params start at column 2
+        # Params start at column 2 (Index 2)
         self.params = self.data.iloc[:, 2:].values.astype(np.float32)
         self.costs = self.data.iloc[:, 1].values.astype(np.float32)
         
@@ -42,8 +49,15 @@ class PlantDataset(Dataset):
 
 class StructureGenerationNet(nn.Module):
     """
-    Generates point clouds (Branch Points & End Points) from parameters.
-    Same architecture as the baseline model.
+    Step 1: Structure Generation
+    ----------------------------
+    Takes the 13 L-system parameters and generates a "Synthetic Point Cloud".
+    It predicts two sets of points:
+    - Branch Points (bp): Where branches split.
+    - End Points (ep): Tips of leaves/branches.
+    
+    It also predicts an 'existence probability' for each point, allowing the
+    network to output variable numbers of points (by setting prob ~ 0).
     """
     def __init__(self, input_dim=INPUT_DIM, max_points=MAX_POINTS):
         super().__init__()
@@ -59,37 +73,50 @@ class StructureGenerationNet(nn.Module):
         self.bp_net = nn.Sequential(
             nn.Linear(64, 128),
             nn.ReLU(),
-            nn.Linear(128, max_points * 3)
+            nn.Linear(128, max_points * 3) # Output: x, y, probability
         )
         self.ep_net = nn.Sequential(
             nn.Linear(64, 128),
             nn.ReLU(),
-            nn.Linear(128, max_points * 3)
+            nn.Linear(128, max_points * 3) # Output: x, y, probability
         )
         
     def forward(self, x):
         features = self.feature_net(x)
+        
+        # Branch Points
         bp_raw = self.bp_net(features).reshape(-1, self.max_points, 3)
-        bp_coords = bp_raw[:, :, :2] * 200.0
+        bp_coords = bp_raw[:, :, :2] * 200.0 # Scale to image coordinates
         bp_probs = torch.sigmoid(bp_raw[:, :, 2])
+        
+        # End Points
         ep_raw = self.ep_net(features).reshape(-1, self.max_points, 3)
         ep_coords = ep_raw[:, :, :2] * 200.0
         ep_probs = torch.sigmoid(ep_raw[:, :, 2])
+        
         return bp_coords, bp_probs, ep_coords, ep_probs
 
 # --- Sinkhorn Layers ---
 
 def log_sinkhorn_iterations(log_alpha, n_iters=5):
-    """Stable Sinkhorn normalization in log-space."""
+    """
+    Performs Sinkhorn normalization in log-space for numerical stability.
+    Iteratively normalizes rows and columns to sum to 1.
+    Result is a 'Doubly Stochastic Matrix' (Soft Permutation).
+    """
     for _ in range(n_iters):
-        # Row norm
+        # Row normalization
         log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
-        # Col norm
+        # Column normalization
         log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
     return log_alpha.exp()
 
 class PointSetEncoder(nn.Module):
-    """Transformer-like encoder to extract features from point sets."""
+    """
+    Encodes a set of 2D points into a feature-rich representation.
+    Uses Self-Attention so the network understands global shape/structure
+    before trying to match points.
+    """
     def __init__(self, input_dim=4, hidden_dim=64):
         super().__init__()
         self.embedding = nn.Sequential(
@@ -97,70 +124,84 @@ class PointSetEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        # Self-attention allows the network to understand global structure of the point cloud
+        # Multi-head attention captures relationships between points
         self.self_attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x):
+        # x shape: [Batch, Points, 4] (x, y, type, prob)
         emb = self.embedding(x)
         attn_out, _ = self.self_attention(emb, emb, emb)
         return self.norm(emb + attn_out)
 
 class SinkhornAssignmentNet(nn.Module):
     """
-    Computes a soft assignment matrix between two point sets using Sinkhoun algorithm.
-    Calculates cost based on the optimal assignment.
+    Step 2: Differentiable Set Matching (Sinkhorn)
+    ----------------------------------------------
+    Calculates the 'Earth Mover's Distance' between Synthetic and Real points.
+    
+    Process:
+    1. Feature Extraction: Encode both point sets (Syn & Real).
+    2. Score Matrix: Compute similarity (dot product) between all pairs.
+    3. Sinkhorn: Normalize scores into a soft Assignment Matrix (Probability they match).
+    4. Physical Cost: Compute actual Euclidean distances between all pairs.
+    5. Weighted Sum: Multiply Probabilities * Distances to get Expected Cost.
     """
     def __init__(self, max_points=MAX_POINTS, feature_dim=64):
         super().__init__()
         self.max_points = max_points
         self.encoder = PointSetEncoder(input_dim=4, hidden_dim=feature_dim)
-        # Learnable temperature for the softness of the assignment
+        # Learnable temperature controls how "sharp" the matching is
         self.log_temperature = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, bp_syn, ep_syn, bp_real, ep_real, bp_probs_syn=None, ep_probs_syn=None):
-        # Features: [Batch, Days, Points, 4] -> Flattened to [Total_Samples, Points, 4]
-        # Or [Batch, Points, 4] if time already handled
+        # inputs are [Batch, Points, 2]
         
-        syn_features = torch.cat([bp_syn, ep_syn], dim=-1)   # (N, P, 4)
-        real_features = torch.cat([bp_real, ep_real], dim=-1) # (N, P, 4)
+        # Combine Branch and End points into single set for feature extraction
+        # Each point gets 4 dims: (x, y, x, y) - simplified feature vector
+        syn_features = torch.cat([bp_syn, ep_syn], dim=-1)   
+        real_features = torch.cat([bp_real, ep_real], dim=-1) 
         
+        # 1. Encode Features (Geometric Context)
         syn_emb = self.encoder(syn_features)
         real_emb = self.encoder(real_features)
         
-        # Assignment Scores (Log-Space logits)
+        # 2. Compute Score Matrix (Similarity)
         temperature = torch.exp(self.log_temperature)
         scores = torch.bmm(syn_emb, real_emb.transpose(1, 2)) / temperature
         
-        # Sinkhorn Iterations -> Soft Permutation Matrix
+        # 3. Sinkhorn Iterations (Normalization)
         assignment_matrix = log_sinkhorn_iterations(scores, n_iters=5)
         
-        # Compute Physical Cost Matrix (Euclidean distance between points)
-        # Broadcast to (N, P_syn, P_real)
+        # 4. Compute Physical Cost Matrix (Euclidean Distances)
+        # Broadcast to create [Batch, N_Syn, N_Real] matrix
         syn_bp_exp = bp_syn.unsqueeze(2)
         real_bp_exp = bp_real.unsqueeze(1)
         syn_ep_exp = ep_syn.unsqueeze(2)
         real_ep_exp = ep_real.unsqueeze(1)
         
+        # Distance = L2(BP_Syn - BP_Real) + L2(EP_Syn - EP_Real)
         bp_dist = torch.norm(syn_bp_exp - real_bp_exp, dim=-1)
         ep_dist = torch.norm(syn_ep_exp - real_ep_exp, dim=-1)
         physical_cost_matrix = bp_dist + ep_dist 
         
-        # Weight cost by existence probability if available
+        # Weight by existence probability
         if bp_probs_syn is not None and ep_probs_syn is not None:
-             # If a point has low prob of existing, its matching cost should matter less?
-             # Or we mask it. Here we multiply cost by existence, so if it doesn't exist, cost is 0.
              point_existence = (bp_probs_syn * ep_probs_syn).unsqueeze(-1)
              physical_cost_matrix = physical_cost_matrix * point_existence
 
-        # Total Cost = frobenius_inner_product(Assignment, CostMatrix)
+        # 5. Calculate Total Expected Cost
+        # Sum(Assignment_Prob * Physical_Distance)
         total_cost = torch.sum(assignment_matrix * physical_cost_matrix, dim=(-1, -2))
+        
         return assignment_matrix, total_cost.unsqueeze(-1)
 
 class CostAggregationNet(nn.Module):
     """
-    Aggregates daily costs.
-    Uses BatchNorm to handle scale variations before linear aggregation.
+    Step 3: Temporal Aggregation
+    ----------------------------
+    Takes the costs from all 26 days and aggregates them into a single
+    scalar metric representing overall "fitness".
     """
     def __init__(self, max_days=MAX_DAYS):
         super().__init__()
@@ -179,6 +220,10 @@ class CostAggregationNet(nn.Module):
         return self.temporal_net(norm_costs)
 
 class HierarchicalPlantSurrogateNet(nn.Module):
+    """
+    Main Model Wrapper.
+    Orchestrates the flow: Params -> Structure -> Sinkhorn Match -> Aggregation -> Cost.
+    """
     def __init__(self, input_dim=INPUT_DIM, max_points=MAX_POINTS, max_days=MAX_DAYS, 
                  input_mean=None, input_std=None, output_mean=None, output_std=None):
         super().__init__()
@@ -186,38 +231,38 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         self.sinkhorn_net = SinkhornAssignmentNet(max_points)
         self.cost_aggregator = CostAggregationNet(max_days)
         
-        # Normalization Buffers
+        # Normalization Stats (Registered buffers, not learnable)
         self.register_buffer('input_mean', torch.tensor(input_mean if input_mean is not None else np.zeros(input_dim), dtype=torch.float32))
         self.register_buffer('input_std', torch.tensor(input_std if input_std is not None else np.ones(input_dim), dtype=torch.float32))
         self.register_buffer('output_mean', torch.tensor(output_mean if output_mean is not None else 0.0, dtype=torch.float32))
         self.register_buffer('output_std', torch.tensor(output_std if output_std is not None else 1.0, dtype=torch.float32))
         
     def forward(self, x, real_bp_batch=None, real_ep_batch=None):
-        # 1. Structure Gen
+        # 1. Input Normalization & Structure Generation
         x_norm = (x - self.input_mean) / self.input_std
         bp_syn, bp_probs, ep_syn, ep_probs = self.structure_gen(x_norm)
         
+        # If inferencing without real targets (just generation), return structure
         if real_bp_batch is None or real_ep_batch is None:
             return bp_syn, bp_probs, ep_syn, ep_probs
         
         # 2. Sinkhorn Assignment (Vectorized Over Days)
-        # We need to reshape inputs to treat (Batch * Days) as a large batch for the Sinkhorn Net
-        # because SinkhornNet is written for (Batch, Points).
-        
+        # Reshape to treat (Batch * Days) as a large batch for parallel processing
         batch_size = x.size(0)
         num_days = real_bp_batch.size(1)
         max_points = bp_syn.size(1)
         
-        # Expand Syn to match Days
+        # Expand Synthetic structure to match number of days (Syn structure is constant for params, but compared against changing daily targets)
         bp_syn_expanded = bp_syn.unsqueeze(1).expand(-1, num_days, -1, -1).reshape(-1, max_points, 2)
         ep_syn_expanded = ep_syn.unsqueeze(1).expand(-1, num_days, -1, -1).reshape(-1, max_points, 2)
         bp_probs_expanded = bp_probs.unsqueeze(1).expand(-1, num_days, -1).reshape(-1, max_points)
         ep_probs_expanded = ep_probs.unsqueeze(1).expand(-1, num_days, -1).reshape(-1, max_points)
         
-        # Flatten Real
+        # Flatten Real structure
         real_bp_flat = real_bp_batch.reshape(-1, max_points, 2)
         real_ep_flat = real_ep_batch.reshape(-1, max_points, 2)
         
+        # Compute Costs
         _, total_costs_flat = self.sinkhorn_net(
             bp_syn_expanded, ep_syn_expanded, 
             real_bp_flat, real_ep_flat, 
@@ -227,7 +272,7 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         # Reshape back to (Batch, Days)
         daily_costs_tensor = total_costs_flat.view(batch_size, num_days)
         
-        # Pad/Truncate Days
+        # Handle day count mismatches (Pad/Truncate)
         current_days = daily_costs_tensor.size(1)
         target_days = 26
         if current_days < target_days:
@@ -238,8 +283,12 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         
         # 3. Aggregation & De-normalization
         final_cost = self.cost_aggregator(daily_costs_tensor)
+        
+        # Recover real scale
         denorm_cost = final_cost * self.output_std + self.output_mean
         return F.softplus(denorm_cost)
+
+
 
 # Helper for compatibility
 def prepare_real_plant_batch(real_bp, real_ep, max_points=50):

@@ -1,7 +1,7 @@
 """
 Dataset Generation Script for PhytomorphicNN.
 Generates synthetic plant structures using L-systems with sampled parameters.
-Supports Latin Hypercube Sampling (LHS) and Random Gaussian Sampling.
+Sampling uses the same random parameter distribution as Nazifa.
 """
 
 import os
@@ -15,7 +15,8 @@ import argparse
 import numpy as np
 import torch
 from datetime import datetime
-from scipy.stats import qmc, norm
+from numpy.random import normal as nran
+from numpy.random import uniform as uran
 
 # Ensure project modules are in path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -34,7 +35,7 @@ TRAIN_SIZE = 10000            # Number of training samples
 VAL_SIZE = 100                # Number of validation samples
 TEST_SIZE = 3000              # Number of test samples
 BASE_OUTPUT_DIR = "Datasets"  # Base directory for generated datasets
-SAMPLING_METHOD = "lhs"       # Sampling method: "lhs" or "random"
+SAMPLING_METHOD = "random"
 
 # --- END USER CONFIGURATION ---
 
@@ -43,23 +44,42 @@ DEFAULT_TRAIN_SIZE = TRAIN_SIZE
 DEFAULT_VAL_SIZE = VAL_SIZE
 DEFAULT_TEST_SIZE = TEST_SIZE
 
-# Param Ranges (Min, Max)
-# Based on usage in lsystem/lsystem.pnl
-PARAM_RANGES = [
-    (1, 20),         # 0: max_phytomers
-    (0.1, 10.0),     # 1: plastochron
-    (-180.0, 180.0), # 2: plant_roll_angle
-    (0.0, 180.0),    # 3: plant_down_angle
-    (0.0, 270.0),    # 4: branch_angle
-    (0.1, 10.0),     # 5: leaf_len
-    (0.01, 1.0),     # 6: exp_leaf_wid
-    (0.01, 2.0),     # 7: leaf_wid
-    (0.0, 180.0),    # 8: leaf_bend_scale
-    (0.0, 360.0),    # 9: leaf_twist_scale
-    (0.0, 2.0),      # 10: node_len
-    (0.01, 2.0),     # 11: int_wid
-    (0.0, 1.0)       # 12: exp_int_rad
+PARAM_NAMES = [
+    "max_phytomers",
+    "plastochron",
+    "plant_roll_angle",
+    "plant_down_angle",
+    "branch_angle",
+    "leaf_len",
+    "exp_leaf_wid",
+    "leaf_wid",
+    "leaf_bend_scale",
+    "leaf_twist_scale",
+    "node_len",
+    "int_wid",
+    "exp_int_rad",
 ]
+
+def configure_output_file_logging(output_dir, run_label):
+    """Route stdout/stderr to a persistent log file when attached to a TTY."""
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
+    stream = open(log_path, "a", buffering=1)
+
+    if sys.stdout.isatty() or sys.stderr.isatty():
+        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
+        try:
+            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+
+        os.dup2(stream.fileno(), 1)
+        os.dup2(stream.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        print(notice)
+
+    return log_path
 
 def setup_logging(log_file):
     """Configures logging to file and console."""
@@ -72,47 +92,33 @@ def setup_logging(log_file):
         ]
     )
 
-def generate_lhs_samples(n_samples):
-    """Generate samples using Latin Hypercube Sampling (Uniform)."""
-    sampler = qmc.LatinHypercube(d=len(PARAM_RANGES))
-    sample = sampler.random(n=n_samples)
-    scaled = qmc.scale(sample, [r[0] for r in PARAM_RANGES], [r[1] for r in PARAM_RANGES])
-    scaled[:, 0] = np.round(scaled[:, 0]) # max_phytomers is integer
-    np.maximum(scaled[:, 0], 1.0, out=scaled[:, 0]) # Ensure >= 1
-    return scaled
-
-def generate_gaussian_samples(n_samples):
-    """Generate samples using Gaussian distributions (Heuristic)."""
-    samples = np.zeros((n_samples, len(PARAM_RANGES)))
+def generate_nazifa_random_samples(n_samples):
+    """Generate samples using the exact Nazifa random parameter distribution."""
+    samples = np.zeros((n_samples, len(PARAM_NAMES)))
     for i in range(n_samples):
-        # Heuristics mimicking utils_nn.build_random_parameter_file
-        chirality = -1.0 if np.random.random() < 0.5 else 1.0
-        
+        # Match utils_nn.build_random_parameter_file exactly.
+        chirality = -1.0 if uran(0.0, 1.0) < 0.5 else 1.0
+
         row = [
-            norm.rvs(10., 1.),                  # max_phytomers
-            norm.rvs(3., 0.1),                  # plastochron
-            norm.rvs(chirality * 90., 10.0),    # plant_roll_angle
-            norm.rvs(0., 4.0),                  # plant_down_angle
-            norm.rvs(135., 5.),                 # branch_angle
-            norm.rvs(5., 1.),                   # leaf_len
-            norm.rvs(0.5, 0.01),                # exp_leaf_wid
-            norm.rvs(1., 0.1),                  # leaf_wid
-            norm.rvs(90., 3.),                  # leaf_bend_scale
-            norm.rvs(180., 3.),                 # leaf_twist_scale
-            norm.rvs(0.7, 0.05),                # node_len
-            norm.rvs(0.9, 0.01),                # int_wid
-            norm.rvs(0.5, 0.01)                 # exp_int_rad
+            nran(10.0, 1.0),
+            nran(3.0, 0.1),
+            nran(chirality * 90.0, 10.0),
+            nran(0.0, 4.0),
+            nran(135.0, 5.0),
+            nran(5.0, 1.0),
+            nran(0.5, 0.01),
+            nran(1.0, 0.1),
+            nran(90.0, 3.0),
+            nran(180.0, 3.0),
+            nran(0.7, 0.05),
+            nran(0.9, 0.01),
+            nran(0.5, 0.01),
         ]
         samples[i] = row
-        
-    # Clip to valid ranges just in case
-    for dim, (low, high) in enumerate(PARAM_RANGES):
-        np.clip(samples[:, dim], low, high, out=samples[:, dim])
-        
-    samples[:, 0] = np.round(samples[:, 0])
+
     return samples
 
-def generate_split(split_name, size, real_data, output_dir, use_lhs=True):
+def generate_split(split_name, size, real_data, output_dir):
     """Generates a dataset split (Train/Val/Test)."""
     if size <= 0:
         return
@@ -124,17 +130,14 @@ def generate_split(split_name, size, real_data, output_dir, use_lhs=True):
     os.makedirs(structures_dir, exist_ok=True)
     
     csv_path = os.path.join(output_dir, f"{split_name}.csv")
-    csv_header = ["id", "cost"] + [f"param_{i}" for i in range(len(PARAM_RANGES))]
+    csv_header = ["id", "cost"] + [f"param_{i}" for i in range(len(PARAM_NAMES))]
     
     # Init CSV
     with open(csv_path, "w", newline="") as f:
         csv.writer(f).writerow(csv_header)
         
-    # Generate Parameters
-    if use_lhs:
-        params_array = generate_lhs_samples(size)
-    else:
-        params_array = generate_gaussian_samples(size)
+    # Generate parameters using Nazifa's random distribution.
+    params_array = generate_nazifa_random_samples(size)
 
     real_bp, real_ep = real_data
     valid_count = 0
@@ -209,8 +212,8 @@ def main():
     parser.add_argument("--val_size", type=int, default=DEFAULT_VAL_SIZE)
     parser.add_argument("--test_size", type=int, default=DEFAULT_TEST_SIZE)
     parser.add_argument("--output_dir", default=None, help="Base output directory")
-    parser.add_argument("--method", choices=["lhs", "random"], default=SAMPLING_METHOD, help="Sampling method")
     args = parser.parse_args()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 0. Setup Directories
     base_dir = args.output_dir
@@ -218,18 +221,24 @@ def main():
         date_str = datetime.now().strftime("%m%d%y")
         candidate = f"Run_{date_str}"
         counter = 0
-        while os.path.exists(os.path.join(BASE_OUTPUT_DIR, candidate)):
+        datasets_root = os.path.join(script_dir, BASE_OUTPUT_DIR)
+        while os.path.exists(os.path.join(datasets_root, candidate)):
             counter += 1
             candidate = f"Run_{date_str}_{counter}"
-        base_dir = os.path.join(BASE_OUTPUT_DIR, candidate)
+        base_dir = os.path.join(datasets_root, candidate)
+    elif not os.path.isabs(base_dir):
+        # Keep user-provided relative paths inside this project by default.
+        base_dir = os.path.join(script_dir, base_dir)
         
     os.makedirs(base_dir, exist_ok=True)
+    log_path = configure_output_file_logging(base_dir, os.path.basename(base_dir))
     setup_logging(os.path.join(base_dir, "generation_log.txt"))
     
     logging.info(f"=== Dataset Generation Started ===")
     logging.info(f"Target Plant: {args.plant}")
     logging.info(f"Output Directory: {base_dir}")
-    logging.info(f"Method: {args.method.upper()}")
+    logging.info(f"Terminal Log: {log_path}")
+    logging.info("Method: RANDOM (Nazifa distribution)")
     
     # 1. Load Real Plant Data
     try:
@@ -247,20 +256,31 @@ def main():
         return
 
     # 2. Generate Splits
-    use_lhs = (args.method == "lhs")
-    
-    generate_split("Train", args.train_size, real_data, base_dir, use_lhs)
-    generate_split("Validation", args.val_size, real_data, base_dir, use_lhs)
-    generate_split("Test", args.test_size, real_data, base_dir, use_lhs)
+    generate_split("Train", args.train_size, real_data, base_dir)
+    generate_split("Validation", args.val_size, real_data, base_dir)
+    generate_split("Test", args.test_size, real_data, base_dir)
     
     # 3. Create Description File
     with open(os.path.join(base_dir, "description.txt"), "w") as f:
         f.write(f"Dataset: {os.path.basename(base_dir)}\n")
         f.write(f"Date: {datetime.now().strftime('%Y-%m-%d')}\n")
-        f.write(f"Method: {args.method}\n")
+        f.write("Method: random (Nazifa distribution)\n")
         f.write(f"Plant: {args.plant}\n")
         f.write(f"Sizes: Train={args.train_size}, Val={args.val_size}, Test={args.test_size}\n")
-        f.write(f"Ranges: {PARAM_RANGES}\n")
+        f.write("Distribution:\n")
+        f.write("max_phytomers ~ N(10, 1)\n")
+        f.write("plastochron ~ N(3, 0.1)\n")
+        f.write("plant_roll_angle ~ N(chirality*90, 10), chirality in {-1,+1} with p=0.5\n")
+        f.write("plant_down_angle ~ N(0, 4)\n")
+        f.write("branch_angle ~ N(135, 5)\n")
+        f.write("leaf_len ~ N(5, 1)\n")
+        f.write("exp_leaf_wid ~ N(0.5, 0.01)\n")
+        f.write("leaf_wid ~ N(1, 0.1)\n")
+        f.write("leaf_bend_scale ~ N(90, 3)\n")
+        f.write("leaf_twist_scale ~ N(180, 3)\n")
+        f.write("node_len ~ N(0.7, 0.05)\n")
+        f.write("int_wid ~ N(0.9, 0.01)\n")
+        f.write("exp_int_rad ~ N(0.5, 0.01)\n")
 
     logging.info("Generation Complete.")
 

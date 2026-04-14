@@ -1,8 +1,8 @@
 """
 Evaluate Trained Surrogate Models.
 
-This script generates comprehensive evaluation reports and visualizations for trained models.
-It analyzes training logs, computes parameter importance, and visualizes performance metrics.
+This module generates evaluation figures for trained models.
+It reads training logs, computes parameter importance, and visualizes performance metrics.
 
 Key Features:
 - Loss & Metric Convergence Plots (Train vs Val)
@@ -13,10 +13,11 @@ Key Features:
 - Individual Plots Saved to Model Directory
 
 Usage:
-    python3 evaluate_models.py --run_dir "Training Data/Run_031326"
+    python3 evaluate_models.py --model_run_dir "Training Data/Run_031326" --dataset_name "Run 021926"
 """
 
 import os
+import sys
 import argparse
 import glob
 import pandas as pd
@@ -36,10 +37,30 @@ from train_models import prepare_real_plant_batch
 # Set umask to 0 so that files created inside docker are accessible on host
 os.umask(0)
 
+def configure_output_file_logging(output_dir, run_label):
+    """Route stdout/stderr to a persistent log file when attached to a TTY."""
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
+    stream = open(log_path, "a", buffering=1)
+
+    if sys.stdout.isatty() or sys.stderr.isatty():
+        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
+        try:
+            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+
+        os.dup2(stream.fileno(), 1)
+        os.dup2(stream.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        print(notice)
+
+    return log_path
+
 # --- Configuration ---
-# Hardcoded Dataset Name (Consistent with training scripts)
-DATASET_NAME = "Run 021926"
-DEFAULT_RUN_DIR = "Training Data/Run_021926"
+DEFAULT_DATASET_NAME = "Run 021926"
+DEFAULT_MODEL_RUN_DIR = "Training Data/Run_033126"
 
 # Parameter names for the 13 inputs (Customize as needed based on your dataset)
 PARAM_NAMES = [
@@ -69,11 +90,16 @@ def load_model_config(model_dir):
         config["module"] = benchmark_mlp
         config["model_class"] = benchmark_mlp.BenchmarkSurrogateNet
         config["dataset_class"] = benchmark_mlp.PlantDataset
+    elif "baseline" in model_name_lower:
+        # In this codebase, "baseline" refers to the benchmark MLP model.
+        config["module"] = benchmark_mlp
+        config["model_class"] = benchmark_mlp.BenchmarkSurrogateNet
+        config["dataset_class"] = benchmark_mlp.PlantDataset
     elif "sinkhorn" in model_name_lower:
         config["module"] = sinkhorn_model
         config["model_class"] = sinkhorn_model.HierarchicalPlantSurrogateNet
         config["dataset_class"] = sinkhorn_model.PlantDataset
-    elif "baseline" in model_name_lower or "hungarian" in model_name_lower:
+    elif "hungarian" in model_name_lower:
         config["module"] = baseline_model
         config["model_class"] = baseline_model.HierarchicalPlantSurrogateNet
         config["dataset_class"] = baseline_model.PlantDataset
@@ -330,7 +356,7 @@ def combine_plots(plots, output_dir):
         print("PIL/Pillow not installed. Skipping combined image generation.")
 
 def compute_test_metrics(model, test_loader, device, real_bp_batch, real_ep_batch):
-    """Computes metrics on the Test Set for consistency with test_results.txt."""
+    """Computes metrics on the Test Set for the evaluation summary card."""
     model.eval()
     all_preds = []
     all_targets = []
@@ -380,7 +406,7 @@ def compute_test_metrics(model, test_loader, device, real_bp_batch, real_ep_batc
         "Acc (<5%)": f"{acc_5pct:.2f}%"
     }
 
-def evaluate_run(run_path, data, output_path=None):
+def evaluate_run(run_path, data, output_path=None, include_metrics_artifacts=True):
     """Evaluates a single model run (replicate)."""
     if output_path is None:
         output_path = run_path
@@ -444,49 +470,77 @@ def evaluate_run(run_path, data, output_path=None):
     except Exception as e:
         print(f"Error generating plots in {run_path}: {e}")
     
-    # 7. Metrics
-    try:
-        # Compute metrics on Test Data (Consistent with test_results.txt)
-        metrics = compute_test_metrics(
-            model, test_loader, device, 
-            data['real_bp_batch'].to(device), 
-            data['real_ep_batch'].to(device)
-        )
-        create_summary_card(metrics, output_path)
-    except Exception as e:
-        print(f"Could not compute test metrics: {e}")
+    # 7. Optional metrics card (disabled when training already owns metrics)
+    if include_metrics_artifacts:
+        try:
+            # Compute metrics on Test Data for the optional summary card.
+            metrics = compute_test_metrics(
+                model, test_loader, device, 
+                data['real_bp_batch'].to(device), 
+                data['real_ep_batch'].to(device)
+            )
+            create_summary_card(metrics, output_path)
+        except Exception as e:
+            print(f"Could not compute test metrics: {e}")
     
     # 8. Combine
     combine_plots([], output_path)
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Trained Models")
-    parser.add_argument("--run_dir", type=str, required=False, help="Path to the Tuning Run directory (e.g., Training Data/Run_X)")
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=DEFAULT_DATASET_NAME,
+        help="Dataset folder name under Datasets/ (e.g., 'Run 021926')"
+    )
+    parser.add_argument(
+        "--model_run_dir",
+        type=str,
+        required=False,
+        help="Path to trained model run directory (e.g., Training Data/Run_X)"
+    )
+    # Backward-compatible alias for older commands.
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        required=False,
+        help="Deprecated alias for --model_run_dir"
+    )
     args = parser.parse_args()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    model_run_dir = args.model_run_dir or args.run_dir
+    dataset_name = args.dataset_name
     
-    # Default to Training Data/DATASET_NAME if not specified
-    if args.run_dir is None:
-        args.run_dir = DEFAULT_RUN_DIR
-        # Check absolute path relative to script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        path_check = os.path.join(script_dir, args.run_dir)
+    # Default to configured model directory if not specified
+    if model_run_dir is None:
+        model_run_dir = DEFAULT_MODEL_RUN_DIR
+    # Resolve relative model path against script directory for consistency.
+    if not os.path.isabs(model_run_dir):
+        path_check = os.path.join(script_dir, model_run_dir)
         if os.path.exists(path_check):
-             args.run_dir = path_check
+            model_run_dir = path_check
     
-    if not os.path.exists(args.run_dir):
-        print(f"Error: Run Directory {args.run_dir} not found.")
+    if not os.path.exists(model_run_dir):
+        print(f"Error: Model Run Directory {model_run_dir} not found.")
         return
 
-    print(f"Model Directory (Weights): {args.run_dir}")
+    run_name = os.path.basename(os.path.normpath(model_run_dir))
+    output_base_dir = os.path.join(script_dir, "Evaluation Results")
+    log_dir = os.path.join(output_base_dir, run_name)
+    log_path = configure_output_file_logging(log_dir, "evaluate_models")
 
-    # Load Data Globals 
-    # Hardcoded Dataset Path (Consistent with training scripts)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    dataset_dir = os.path.join(current_dir, "Datasets", DATASET_NAME)
+    print(f"Model Directory (Weights): {model_run_dir}")
+    print(f"Terminal Log: {log_path}")
+
+    # Load Data Globals
+    current_dir = script_dir
+    dataset_dir = os.path.join(current_dir, "Datasets", dataset_name)
     
     # Check for dataset
     if not os.path.exists(os.path.join(dataset_dir, "Train.csv")):
-        print(f"Error: Data Source (CSVs) '{DATASET_NAME}' not found in {dataset_dir}")
+        print(f"Error: Data Source (CSVs) '{dataset_name}' not found in {dataset_dir}")
         return
 
     print(f"Data Source (CSVs):      {dataset_dir}")
@@ -494,7 +548,6 @@ def main():
     test_csv = os.path.join(dataset_dir, "Test.csv")
     
     # Calc Norm Stats (Required for model init)
-    import pandas as pd
     try:
         df_train = pd.read_csv(train_csv)
         params = df_train.iloc[:, 2:15].values
@@ -533,16 +586,13 @@ def main():
     output_base_dir = os.path.join(script_dir, "Evaluation Results")
 
     # Walk through directory
-    for root, dirs, files in os.walk(args.run_dir):
+    for root, dirs, files in os.walk(model_run_dir):
         if "best_model.pt" in files and "training_log.csv" in files:
             # Determine output path specifically for this model
             # 1. Get path relative to the specific Run Directory provided
-            rel_path_from_run = os.path.relpath(root, args.run_dir)
+            rel_path_from_run = os.path.relpath(root, model_run_dir)
             
-            # 2. Get the name of the Run Directory itself (e.g. Run_031626)
-            run_name = os.path.basename(os.path.normpath(args.run_dir))
-            
-            # 3. Construct full output path: Evaluation Results / Run_X / Model / Rep
+            # 2. Construct full output path: Evaluation Results / Run_X / Model / Rep
             output_path = os.path.join(output_base_dir, run_name, rel_path_from_run)
             
             evaluate_run(root, data, output_path=output_path)

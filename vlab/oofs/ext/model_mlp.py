@@ -1,8 +1,14 @@
 """
 Benchmark Standard MLP Surrogate Model.
 
-Provides a standard fully-connected baseline for comparison against
-Phytomorphic architectures. Includes dataset handling and model definition.
+Input: Plant Growth Parameters (13 params)
+Output: Predicted Cost (Scalar)
+
+Architecture:
+- Simple Feed-Forward Neural Network (MLP).
+- Does NOT generate structure.
+- Does NOT use specialized distance metrics.
+- Serves as a baseline to prove that the structural/hierarchical approach adds value.
 """
 
 import torch
@@ -16,32 +22,18 @@ import numpy as np
 MODEL_NAME = "benchmark_mlp.pt"
 INPUT_DIM = 13
 
-# Dataset column indices (0-based)
-COL_COST = 1
-COL_PARAMS_START = 2
-COL_PARAMS_END = 15  # Exclusive (slices are start:end)
-
 class PlantDataset(Dataset):
     """
     Standard PyTorch Dataset for plant parameters and costs.
-    
-    Expected CSV Structure:
-        [ID, Cost, Param1, ..., Param13, ...]
-        - Column 1: Cost (Target)
-        - Columns 2-14: Parameters (Features)
+    Expects CSV with columns: [ID, Cost, Param1, Param2, ..., Param13]
     """
     def __init__(self, csv_file, root_dir=None):
-        """
-        Args:
-            csv_file (str): Path to the CSV file.
-            root_dir (str, optional): Root directory for images (unused, kept for compatibility).
-        """
         self.data = pd.read_csv(csv_file)
         self.root_dir = root_dir
-        
-        # Extract features (Params) and targets (Costs)
-        self.params = self.data.iloc[:, COL_PARAMS_START:COL_PARAMS_END].values.astype(np.float32)
-        self.costs = self.data.iloc[:, COL_COST].values.astype(np.float32)
+        # Params start at column 2 (Index 2)
+        # Using 2: to capture all remaining columns as parameters, consistent with other models
+        self.params = self.data.iloc[:, 2:].values.astype(np.float32)
+        self.costs = self.data.iloc[:, 1].values.astype(np.float32)
         
     def __len__(self):
         return len(self.data)
@@ -65,7 +57,7 @@ class BenchmarkSurrogateNet(nn.Module):
                  output_mean=None, output_std=None):
         super().__init__()
         
-        # Regression Network
+        # Simple Regression Network
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -98,11 +90,15 @@ class BenchmarkSurrogateNet(nn.Module):
         
         Args:
             x (Tensor): Input parameters.
-            real_bp, real_ep: Ignored (compatibility args).
+            real_bp, real_ep: Ignored (compatibility args for shared training loop).
         """
-        # Normalize -> Infer -> Denormalize
+        # Normalize Inputs
         x_norm = (x - self.input_mean) / (self.input_std + 1e-6)
+        
+        # Inference
         out_norm = self.net(x_norm)
+        
+        # De-normalize Output
         out = out_norm * self.output_std + self.output_mean
         
         return out.squeeze()
@@ -120,6 +116,7 @@ def benchmark_loss_function(pred, target, *args):
         tuple: (total_loss, mse_component, structure_component, alignment_component)
     """
     loss = F.mse_loss(pred.squeeze(), target.squeeze())
+    # Return tuple matching the signature of complex losses for compatibility
     return loss, loss, 0.0, 0.0
 
 def get_scheduler(optimizer):

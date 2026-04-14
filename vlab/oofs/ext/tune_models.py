@@ -22,7 +22,12 @@ import model_mlp as benchmark_mlp
 import utils_nn
 
 # Import training worker from existing pipeline
-from train_models import train_model_worker, aggregate_results, prepare_real_plant_batch
+from train_models import (
+    train_model_worker,
+    aggregate_results,
+    prepare_real_plant_batch,
+    configure_output_file_logging,
+)
 
 # --- User Configuration ---
 DATASET_NAME = "Run 021926"
@@ -177,8 +182,11 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tuning_dir = os.path.join(data["dataset_dir"], f"Tuning_Run_{timestamp}")
     os.makedirs(tuning_dir, exist_ok=True)
+
+    log_path = configure_output_file_logging(tuning_dir, f"Tuning_Run_{timestamp}")
     
     print(f"Output Directory: {tuning_dir}")
+    print(f"Terminal Log: {log_path}")
     
     # Save HP Grid for reference
     with open(os.path.join(tuning_dir, "hp_grid.txt"), "w") as f:

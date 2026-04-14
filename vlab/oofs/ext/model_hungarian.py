@@ -1,8 +1,14 @@
 """
 Hierarchical Surrogate Neural Network (Baseline + Scheduler).
-Decomposes the problem into:
-1. Structure Generation: Generates synthetic plant structure from L-system params.
-2. Structure Comparison: Compares synthetic structure with real daily snapshots.
+
+Input: Plant Growth Parameters (13 params)
+Output: Predicted Structural Difference (Cost) vs Real Plant
+
+Architecture Decomposed:
+1. Structure Generation: Generates synthetic point clouds (BP and EP) from parameters.
+2. Structure Comparison: A learnable distance metric network that compares synthetic vs real point clouds.
+   - Unlike Sinkhorn, this does not explicitly compute optimal transport.
+   - It learns to approximate the cost function directly from point coordinates.
 3. Cost Aggregation: Aggregates daily comparison costs into a final fitness value.
 """
 
@@ -27,7 +33,7 @@ class PlantDataset(Dataset):
     def __init__(self, csv_file, root_dir=None):
         self.data = pd.read_csv(csv_file)
         self.root_dir = root_dir
-        # Assuming params start at column 2 (index 2)
+        # Params start at column 2 (Index 2)
         self.params = self.data.iloc[:, 2:].values.astype(np.float32)
         self.costs = self.data.iloc[:, 1].values.astype(np.float32)
         
@@ -41,6 +47,8 @@ class PlantDataset(Dataset):
 
 class StructureGenerationNet(nn.Module):
     """
+    Step 1: Structure Generation
+    ----------------------------
     Generates point clouds (Branch Points & End Points) from parameters.
     Also predicts 'existence probability' for each point to handle variable numbers of points.
     """
@@ -88,15 +96,21 @@ class StructureGenerationNet(nn.Module):
 
 class StructureComparisonNet(nn.Module):
     """
-    Compares a generated structure (synthetic) with a real structure (target).
-    Originally named 'HungarianAssignmentNet' but functions as a learnable distance metric.
+    Step 2: Learnable Distance Metric
+    ---------------------------------
+    This network learns to output the scalar 'cost' given two point sets.
+    It functions as a learned approximation of the Hungarian Algorithm cost.
+    
+    Inputs: 
+    - Synthetic Structure (BP, EP)
+    - Real Structure (BP, EP)
     """
     def __init__(self, max_points=MAX_POINTS):
         super().__init__()
         self.max_points = max_points
         
         # Inputs: (BP_Syn, EP_Syn, BP_Real, EP_Real) flattened
-        # Each is max_points * 2 coords.
+        # Each set is max_points * 2 coords.
         input_size = (max_points * 2) * 4 
         
         self.structure_encoder = nn.Sequential(
@@ -119,13 +133,13 @@ class StructureComparisonNet(nn.Module):
         batch_size = bp_syn.size(0)
         scale = 200.0
         
-        # Normalize coordinates
+        # Normalize coordinates to [0, 1] range for stability
         bp_syn_norm = bp_syn / scale
         ep_syn_norm = ep_syn / scale
         bp_real_norm = bp_real / scale
         ep_real_norm = ep_real / scale
         
-        # Flatten and Concatenate
+        # Flatten and Concatenate all point sets into one large vector
         structure_features = torch.cat([
             bp_syn_norm.reshape(batch_size, -1),
             ep_syn_norm.reshape(batch_size, -1),
@@ -136,12 +150,17 @@ class StructureComparisonNet(nn.Module):
         encoded = self.structure_encoder(structure_features)
         
         # Output is a scalar representing the 'cost' of the mismatch for this pair
-        # We scale it back up to match the magnitude of real costs
+        # We scale it back up (x10000) to match the magnitude of real costs
         raw_cost = self.cost_net(encoded)
         return raw_cost * 10000.0
 
 class CostAggregationNet(nn.Module):
-    """Aggregates daily costs into a final total cost."""
+    """
+    Step 3: Aggregation
+    -------------------
+    Aggregates daily costs into a final total cost.
+    Uses a small neural network to learn temporal weighting if necessary.
+    """
     def __init__(self, max_days=MAX_DAYS):
         super().__init__()
         self.max_days = max_days
@@ -162,6 +181,7 @@ class CostAggregationNet(nn.Module):
 class HierarchicalPlantSurrogateNet(nn.Module):
     """
     Main Surrogate Model class.
+    Orchestrates the pipeline: (Params -> Structure -> Learned Distance -> Aggregate -> Cost)
     """
     def __init__(self, input_dim=INPUT_DIM, max_points=MAX_POINTS, max_days=MAX_DAYS, 
                  input_mean=None, input_std=None, output_mean=None, output_std=None):
@@ -186,7 +206,7 @@ class HierarchicalPlantSurrogateNet(nn.Module):
             return bp_syn, bp_probs, ep_syn, ep_probs
         
         # 2. Compare Synthetic Structure with Real Structure for each day
-        # Note: This loop can be slow. Could be vectorized if StructureComparisonNet supported time dimension.
+        # Note: This loop iterates through days.
         daily_costs = []
         num_days = real_bp_batch.size(1)
         
@@ -200,7 +220,7 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         # Stack into (Batch, Days)
         daily_costs_tensor = torch.stack(daily_costs, dim=1).squeeze(-1)
         
-        # Pad or Truncate to fixed number of days for Aggregator
+        # Normalize Day Count (Pad or Truncate to fixed number of days for Aggregator)
         current_days = daily_costs_tensor.size(1)
         target_days = 26
         if current_days < target_days:
@@ -215,31 +235,24 @@ class HierarchicalPlantSurrogateNet(nn.Module):
         # 4. De-normalize to Real Scale
         denorm_cost = final_cost_norm * self.output_std + self.output_mean
         
-        # Optional: Bias correction for low cost values (legacy logic preserved)
-        bias_correction = torch.where(denorm_cost < 60000, 
-                                    -1000 * torch.sigmoid((60000 - denorm_cost) / 5000), 
-                                    torch.zeros_like(denorm_cost))
-                                    
-        return F.softplus(denorm_cost + bias_correction)
+        return F.softplus(denorm_cost)
 
 def hierarchical_loss_function(pred_cost, true_cost, bp_syn, bp_probs, ep_syn, ep_probs, inputs, real_bp, real_ep):
     """
     Computes composite loss:
     1. MSE on Final Cost (Regression)
-    2. Auxiliary loss on predicted Point Counts (approximate structure correctness)
-    3. Regularization on Coordinate Variance
+    2. Auxiliary loss on predicted Point Counts (Structural Regularization)
+    3. Regularization on Coordinate Variance (Stability)
     """
     # Main Task Loss
     cost_loss = F.mse_loss(pred_cost, true_cost)
     
     # Auxiliary: Point Count Matching
-    # (Since we have probs, sum(probs) = expected count)
+    # (Since we have probs, sum(probs) = number of active points generated)
+    # We compare this to the average number of points in the real plant over time
     bp_count_target = torch.tensor([min(len(day_bp), 50) for day_bp in real_bp], device=pred_cost.device).float().mean()
     ep_count_target = torch.tensor([min(len(day_ep), 50) for day_ep in real_ep], device=pred_cost.device).float().mean()
     
-    bp_count_pred = bp_probs.mean(dim=0).sum() # Average across batch, then sum probs
-    ep_count_pred = ep_probs.mean(dim=0).sum()
-    # Actually, simpler: sum probs per sample, then mean across batch
     bp_count_pred = bp_probs.sum(dim=1).mean()
     ep_count_pred = ep_probs.sum(dim=1).mean()
 

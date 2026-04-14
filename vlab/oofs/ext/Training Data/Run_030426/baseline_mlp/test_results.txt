@@ -1,3 +1,0 @@
-Model: baseline_mlp
-Date: 030426
-Test Loss: 7634895339.5200
