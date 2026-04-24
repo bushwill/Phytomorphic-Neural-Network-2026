@@ -41,7 +41,10 @@ RUN if [ -f /usr/lib/x86_64-linux-gnu/libglut.so.3.12 ]; then \
 # Create ubuntu user if not exists (ubuntu:latest usually creates uid 1000)
 # Ensure correct permissions for /app
 COPY . /app
-# RUN chown -R 1000:1000 /app
+RUN chmod -R 777 /app
+RUN groupadd -g 1001 ubuntu_group || true
+RUN useradd -m -u 1001 -g 1001 -s /bin/bash ubuntu_user || true
+RUN chown -R 1001:1001 /app
 
 # The container will run as user 1000 (specified in docker-compose)
 # But we need to ensure Xvfb can be started properly by user

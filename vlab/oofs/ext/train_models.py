@@ -29,12 +29,16 @@ import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
+# Prevent docker generated files from locking out host user
+os.umask(0)
+
 # --- Import Model Architectures ---
+import model_base
 import model_hungarian
 import model_sinkhorn
 import model_mlp
 import utils_nn as plant_comparison_nn
-from utils_nn import read_real_plants
+from utils_nn import read_real_plants, prepare_real_plant_batch, configure_output_file_logging, load_lsystem_guidance_batch
 
 # --- USER CONFIGURATION ---
 DATASET_NAME = "Run 031326"  # Source folder in Datasets/
@@ -59,9 +63,9 @@ MODELS_TO_TRAIN = [
     },
     {
         "name": "hungarian",
-        "dataset_class": model_hungarian.PlantDataset,
+        "dataset_class": model_base.PlantDataset,
         "model_class": model_hungarian.HierarchicalPlantSurrogateNet,
-        "loss_fn": model_hungarian.hierarchical_loss_function,
+        "loss_fn": model_base.hierarchical_loss_function,
         "batch_size": BATCH_SIZE,
         "learning_rate": LEARNING_RATE,
         "epochs": NUM_EPOCHS,
@@ -69,45 +73,61 @@ MODELS_TO_TRAIN = [
     },
     {
         "name": "sinkhorn",
-        "dataset_class": model_sinkhorn.PlantDataset,
+        "dataset_class": model_base.PlantDataset,
         "model_class": model_sinkhorn.HierarchicalPlantSurrogateNet,
-        "loss_fn": model_sinkhorn.hierarchical_loss_function,
+        "loss_fn": model_base.hierarchical_loss_function,
         "batch_size": BATCH_SIZE,
         "learning_rate": LEARNING_RATE,
         "epochs": NUM_EPOCHS,
         "module": model_sinkhorn
+    },
+    {
+        "name": "sinkhorn_full",
+        "dataset_class": model_base.PlantDataset,
+        "model_class": model_sinkhorn.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_base.hierarchical_loss_function,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_sinkhorn,
+        "model_kwargs": {"use_encoder": True, "use_scaler": True, "use_aggregator": True}
+    },
+    {
+        "name": "sinkhorn_no_encoder",
+        "dataset_class": model_base.PlantDataset,
+        "model_class": model_sinkhorn.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_base.hierarchical_loss_function,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_sinkhorn,
+        "model_kwargs": {"use_encoder": False, "use_scaler": True, "use_aggregator": True}
+    },
+    {
+        "name": "sinkhorn_no_scaler",
+        "dataset_class": model_base.PlantDataset,
+        "model_class": model_sinkhorn.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_base.hierarchical_loss_function,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_sinkhorn,
+        "model_kwargs": {"use_encoder": True, "use_scaler": False, "use_aggregator": True}
+    },
+    {
+        "name": "sinkhorn_no_aggregator",
+        "dataset_class": model_base.PlantDataset,
+        "model_class": model_sinkhorn.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_base.hierarchical_loss_function,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "epochs": NUM_EPOCHS,
+        "module": model_sinkhorn,
+        "model_kwargs": {"use_encoder": True, "use_scaler": True, "use_aggregator": False}
     }
 ]
 
-os.umask(0)
 
-def configure_output_file_logging(output_dir, run_label):
-    """
-    Route stdout/stderr to a persistent run log file when attached to a TTY.
-
-    This prevents worker processes from stalling on terminal backpressure while
-    keeping script usage unchanged (e.g. `python3 train_models.py`).
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
-
-    # Line-buffered append keeps output streaming to disk for long runs.
-    stream = open(log_path, "a", buffering=1)
-
-    if sys.stdout.isatty() or sys.stderr.isatty():
-        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
-        try:
-            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
-        except OSError:
-            pass
-
-        os.dup2(stream.fileno(), 1)
-        os.dup2(stream.fileno(), 2)
-        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
-        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
-        print(notice)
-
-    return log_path
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -116,8 +136,12 @@ def parse_arguments():
                         help=f"Dataset folder (default: '{DATASET_NAME}')")
     parser.add_argument("--plant", type=str, default=PLANT_NAME,
                         help=f"Real plant name (default: '{PLANT_NAME}')")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Optional output run name override for Training Data")
     parser.add_argument("--replicates", type=int, default=NUM_REPLICATES, 
                         help=f"Replicates per model (default: {NUM_REPLICATES})")
+    parser.add_argument("--models", type=str, nargs="+", default=None,
+                        help="List of model names to train (e.g., baseline sinkhorn). If not provided, trains all models in registry.")
     parser.add_argument("--no-multiprocessing", action="store_true", default=not USE_MULTIPROCESSING, 
                         help="Disable multiprocessing")
     parser.add_argument("--skip-evaluation", action="store_true",
@@ -126,33 +150,7 @@ def parse_arguments():
 
 # --- UTILS ---
 
-def prepare_real_plant_batch(real_bp, real_ep, max_points=50, use_multiprocessing=True):
-    """
-    Pre-processes real plant data into fixed-size tensors for batching.
-    Moves data to shared memory if multiprocessing is enabled.
-    
-    Args:
-        real_bp (list): List of daily branch point lists [Day -> Points].
-        real_ep (list): List of daily end point lists.
-    """
-    num_days = len(real_bp)
-    bp_batch = torch.zeros(1, num_days, max_points, 2)
-    ep_batch = torch.zeros(1, num_days, max_points, 2)
-    
-    for day in range(num_days):
-        # Fill tensors from lists, truncating to max_points
-        if len(real_bp[day]) > 0:
-            count = min(len(real_bp[day]), max_points)
-            bp_batch[0, day, :count, :] = torch.tensor(real_bp[day][:count], dtype=torch.float32)
-        if len(real_ep[day]) > 0:
-            count = min(len(real_ep[day]), max_points)
-            ep_batch[0, day, :count, :] = torch.tensor(real_ep[day][:count], dtype=torch.float32)
-            
-    if use_multiprocessing:
-        bp_batch.share_memory_()
-        ep_batch.share_memory_()
-        
-    return bp_batch, ep_batch
+
 
 def train_one_epoch(model, loader, optimizer, real_bp_batch, real_ep_batch, 
                    real_bp_raw, real_ep_raw, model_config, training_log_csv=None, epoch_num=1):
@@ -176,7 +174,15 @@ def train_one_epoch(model, loader, optimizer, real_bp_batch, real_ep_batch,
     batch_idx = 0
     total_batches = len(loader)
     
-    for params, costs in loader:
+    dataset = getattr(loader, "dataset", None)
+    structures_dir = getattr(dataset, "structures_dir", None)
+
+    for batch in loader:
+        if len(batch) == 3:
+            params, costs, sample_ids = batch
+        else:
+            params, costs = batch
+            sample_ids = None
         optimizer.zero_grad()
         bs = params.size(0)
         
@@ -211,14 +217,34 @@ def train_one_epoch(model, loader, optimizer, real_bp_batch, real_ep_batch,
         if hasattr(model, 'structure_gen'):
             bp_syn, bp_probs, ep_syn, ep_probs = model.structure_gen(norm_params)
 
+        guidance_bp = guidance_ep = guidance_bp_mask = guidance_ep_mask = None
+        if sample_ids is not None and structures_dir is not None:
+            guidance_bp, guidance_ep, guidance_bp_mask, guidance_ep_mask = load_lsystem_guidance_batch(
+                structures_dir,
+                sample_ids,
+                max_points=bp_syn.size(1) if bp_syn is not None else 50,
+            )
+
         # 5. Compute Loss
         loss, _, _, _ = loss_fn(
-            pred_cost_norm, norm_costs, bp_syn, bp_probs, ep_syn, ep_probs, params, real_bp_raw, real_ep_raw
+            pred_cost_norm,
+            norm_costs,
+            bp_syn,
+            bp_probs,
+            ep_syn,
+            ep_probs,
+            params,
+            real_bp_raw,
+            real_ep_raw,
+            guidance_bp,
+            guidance_ep,
+            guidance_bp_mask,
+            guidance_ep_mask,
         )
              
         # Stability: Clamp Sinkhorn Temperature
-        if is_sinkhorn and hasattr(model, 'sinkhorn_net') and hasattr(model.sinkhorn_net, 'log_temperature'):
-             model.sinkhorn_net.log_temperature.data.clamp_(min=-5.0)
+        if is_sinkhorn and hasattr(model, 'assignment_net') and hasattr(model.assignment_net, 'log_temperature'):
+            model.assignment_net.log_temperature.data.clamp_(min=-5.0)
 
         # 6. Optimize
         loss.backward()
@@ -249,7 +275,11 @@ def validate(model, loader, real_bp_batch, real_ep_batch):
     all_targets_list = []
     
     with torch.no_grad():
-        for params, costs in loader:
+        for batch in loader:
+            if len(batch) == 3:
+                params, costs, _ = batch
+            else:
+                params, costs = batch
             bs = params.size(0)
             curr_bp = real_bp_batch.repeat(bs, 1, 1, 1)
             curr_ep = real_ep_batch.repeat(bs, 1, 1, 1)
@@ -328,9 +358,9 @@ def train_model_worker(config, run_dir, input_mean, input_std, output_mean, outp
     val_ds = PlantDataset(*val_ds_args)
     test_ds = PlantDataset(*test_ds_args)
     
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0, pin_memory=False)
+    test_loader = DataLoader(test_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0, pin_memory=False)
 
     # Output Paths
     if total_replicates > 1:
@@ -345,11 +375,13 @@ def train_model_worker(config, run_dir, input_mean, input_std, output_mean, outp
     
     # Initialize Model
     ModelClass = config["model_class"]
+    model_kwargs = config.get("model_kwargs", {})
     model = ModelClass(
         input_mean=input_mean, 
         input_std=input_std,
         output_mean=output_mean,
-        output_std=output_std
+        output_std=output_std,
+        **model_kwargs
     )
     
     if use_multiprocessing:
@@ -572,13 +604,19 @@ def main():
     use_multi = not args.no_multiprocessing
     run_eval_after_training = not args.skip_evaluation
     
+    global MODELS_TO_TRAIN
+    if args.models:
+        MODELS_TO_TRAIN = [m for m in MODELS_TO_TRAIN if m["name"] in args.models]
+        if not MODELS_TO_TRAIN:
+            raise ValueError(f"No valid models found matching {args.models}")
+    
     # Determine Output Directory
     base_dir = os.path.dirname(os.path.abspath(__file__))
     datasets_dir = os.path.join(base_dir, "Datasets", dataset_run)
     output_root = os.path.join(base_dir, "Training Data")
     
     date_str = datetime.now().strftime("%m%d%y")
-    run_name = f"Run_{date_str}"
+    run_name = args.run_name or f"Run_{date_str}"
     
     # Handle Name Collisions
     counter = 0
@@ -608,7 +646,7 @@ def main():
     test_csv = os.path.join(datasets_dir, "Test.csv")
     
     # Calculate Stats for Normalization (Using Baseline class as helper)
-    ds_temp = model_hungarian.PlantDataset(train_csv)
+    ds_temp = model_base.PlantDataset(train_csv)
     input_mean = ds_temp.params.mean(axis=0)
     input_std = ds_temp.params.std(axis=0) + 1e-8
     output_mean = ds_temp.costs.mean()
@@ -661,6 +699,8 @@ def main():
                 processes.append(p)
         for p in processes:
             p.join()
+            if p.exitcode not in (0, None):
+                raise RuntimeError(f"Training worker {p.name} exited with code {p.exitcode}")
     else:
         for rep in range(1, replicates_count + 1):
             for config in MODELS_TO_TRAIN:

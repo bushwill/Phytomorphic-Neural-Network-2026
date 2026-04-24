@@ -52,7 +52,7 @@ class BenchmarkSurrogateNet(nn.Module):
         Does not use hierarchical structure or optimal transport (Sinkhorn) loss.
         Intended as a baseline for regression performance comparison.
     """
-    def __init__(self, input_dim=INPUT_DIM, hidden_dim=64, 
+    def __init__(self, input_dim=INPUT_DIM, hidden_dim=128, 
                  input_mean=None, input_std=None, 
                  output_mean=None, output_std=None):
         super().__init__()

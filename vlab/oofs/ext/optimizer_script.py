@@ -1,22 +1,19 @@
 """
-Hierarchical Optimizer Script.
+Hierarchical Surrogate Optimization Script.
 
 Purpose:
-    Uses trained surrogate models to find the optimal L-System parameters that minimize
-    the structural difference (cost) between a generated plant and a target real plant.
+    Utilizes pre-trained, fully differentiable surrogate neural networks (Sinkhorn, Hungarian, MLP)
+    to discover optimal Procedural Generation (L-System) parameters for a target biological phenotype.
 
-Method:
-    Instead of direct gradient descent on parameters (which can be unstable), we use a 
-    small "Generator Network" (OptimizerNet) that outputs the parameters. We optimize 
-    the weights of this generator to minimize the surrogate model's predicted cost.
-    This allows us to leverage the Adam optimizer effectively for the parameter search.
+Methodology:
+    Because direct parameter gradient descent is susceptible to out-of-bound errors and vanishing gradients,
+    we deploy an implicit Generator Network (`OptimizerNet`). By freezing the Surrogate Network's weights and 
+    backpropagating the hierarchical structural loss through it into the Generator Network, the Adam optimizer 
+    can robustly navigate the continuous parameter space to minimize topological discrepancies between 
+    the synthesized output and the ground-truth real plant architecture.
 
-Configuration:
-    Adjust the hard-coded settings below to control which models are optimized,
-    how many restarts/steps are used, and where outputs are written.
-
-Usage:
-    python3 hier_optimizer_script.py --run_dir "Training Data/Run_021926"
+Execution:
+    This script is designed to be executed mechanically via bash orchestration pipelines (e.g. `experiment.sh`).
 """
 
 import os
@@ -30,13 +27,15 @@ import argparse
 import subprocess
 import numpy as np
 import torch
+import concurrent.futures
+
+# Prevent docker generated files from locking out host user
+os.umask(0)
 import torch.nn as nn
 import torch.optim as optim
 from datetime import datetime
 from pathlib import Path
-
-# Match the rest of the pipeline so host-mounted files remain editable/removable.
-os.umask(0)
+import utils_nn  # Ensure we have access to the module's root scope to set the variable
 
 # --- Local Imports ---
 # Cleanly import project modules, handling potential path issues
@@ -73,27 +72,6 @@ SUPPORTED_MODEL_FAMILIES = {"baseline", "hungarian", "sinkhorn"}
 # These ranges should match the bounds used during data generation.
 PARAM_MIN = torch.tensor([8.0, 2.8, -110.0, -4.0, 125.0, 3.0, 0.48, 0.8, 80.0, 170.0, 0.6, 0.88, 0.48])
 PARAM_MAX = torch.tensor([12.0, 3.2, 110.0, 4.0, 145.0, 7.0, 0.52, 1.2, 100.0, 190.0, 0.8, 0.92, 0.52])
-
-def configure_output_file_logging(output_dir, run_label):
-    """Route stdout/stderr to a persistent log file when attached to a TTY."""
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
-    stream = open(log_path, "a", buffering=1)
-
-    if sys.stdout.isatty() or sys.stderr.isatty():
-        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
-        try:
-            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
-        except OSError:
-            pass
-
-        os.dup2(stream.fileno(), 1)
-        os.dup2(stream.fileno(), 2)
-        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
-        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
-        print(notice)
-
-    return log_path
 
 class OptimizerNet(nn.Module):
     """
@@ -186,27 +164,6 @@ def extract_model_family(model_path):
 
     return family
 
-def prepare_real_plant_batch(real_bp, real_ep, max_points=50, device='cpu'):
-    """
-    Converts lists of real plant branch/end points into padded tensors 
-    compatible with the surrogate models.
-    """
-    num_days = len(real_bp)
-    bp_batch = torch.zeros(1, num_days, max_points, 2, device=device)
-    ep_batch = torch.zeros(1, num_days, max_points, 2, device=device)
-    
-    for day in range(num_days):
-        # Branch Points
-        if len(real_bp[day]) > 0:
-            count = min(len(real_bp[day]), max_points)
-            bp_batch[0, day, :count, :] = torch.tensor(real_bp[day][:count], dtype=torch.float32)
-        # End Points
-        if len(real_ep[day]) > 0:
-            count = min(len(real_ep[day]), max_points)
-            ep_batch[0, day, :count, :] = torch.tensor(real_ep[day][:count], dtype=torch.float32)
-            
-    return bp_batch, ep_batch
-
 def load_model(model_path):
     """
     Identifies and loads a trained surrogate model from a .pt file.
@@ -252,20 +209,38 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
     """
     os.makedirs(output_dir, exist_ok=True)
     temp_id = uuid.uuid4().hex[:6]
-    param_file = os.path.join(output_dir, f"opt_{temp_id}.vset")
+    lsystem_dir = os.path.join(SCRIPT_DIR, "lsystem")
+    verify_tmp_root = os.path.join(lsystem_dir, "verify_tmp")
+    os.makedirs(verify_tmp_root, exist_ok=True)
+    worker_ws = os.path.join(verify_tmp_root, f"worker_{temp_id}")
+    os.makedirs(worker_ws, exist_ok=True)
+    
+    # Copy essential files to an isolated workspace for this worker
+    for item in os.listdir(lsystem_dir):
+        src = os.path.join(lsystem_dir, item)
+        if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
+            import shutil
+            shutil.copy2(src, os.path.join(worker_ws, item))
+
+    # Recompile project.cpp safely in the isolated path safely if necessary
+    if not os.path.exists(os.path.join(worker_ws, "project")):
+        os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
+        
+    verify_tmp_dir = os.path.join(worker_ws, f"run_{temp_id}")
+    os.makedirs(verify_tmp_dir, exist_ok=True)
+    param_file = os.path.join(worker_ws, f"opt_{temp_id}.vset")
     
     # Write parameters to file.
     build_parameter_file(param_file, params.tolist())
     
     # 1. LPFG (Generate Structure)
     # Assumes 'lpfg' is in PATH or otherwise discoverable by the shell.
-    lsystem_dir = os.path.join(SCRIPT_DIR, "lsystem")
-    lsystem_l = os.path.join(lsystem_dir, "lsystem.l")
-    view_v = os.path.join(lsystem_dir, "view.v")
-    materials_mat = os.path.join(lsystem_dir, "materials.mat")
-    contours_cset = os.path.join(lsystem_dir, "contours.cset")
-    functions_fset = os.path.join(lsystem_dir, "functions.fset")
-    functions_tset = os.path.join(lsystem_dir, "functions.tset")
+    lsystem_l = os.path.join(worker_ws, "lsystem.l")
+    view_v = os.path.join(worker_ws, "view.v")
+    materials_mat = os.path.join(worker_ws, "materials.mat")
+    contours_cset = os.path.join(worker_ws, "contours.cset")
+    functions_fset = os.path.join(worker_ws, "functions.fset")
+    functions_tset = os.path.join(worker_ws, "functions.tset")
 
     lpfg_cmd = [
         "lpfg", "-w", "306", "256",
@@ -275,9 +250,12 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
     ]
     
     try:
-        lpfg_result = subprocess.run(lpfg_cmd, capture_output=True, text=True, check=True, cwd=SCRIPT_DIR)
+        # We explicitly run CWD into this isolated environment and wait sequentially
+        lpfg_result = subprocess.run(lpfg_cmd, capture_output=True, text=True, check=True, cwd=worker_ws)
     except FileNotFoundError:
         logging.error("LPFG execution failed. Ensure 'lpfg' is in PATH.")
+        import shutil
+        shutil.rmtree(worker_ws, ignore_errors=True)
         return None, None
     except subprocess.CalledProcessError as e:
         stderr_msg = (e.stderr or "").strip()
@@ -285,19 +263,23 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
             logging.error(f"LPFG execution failed: {stderr_msg}")
         else:
             logging.error("LPFG execution failed with non-zero exit code.")
+        import shutil
+        shutil.rmtree(worker_ws, ignore_errors=True)
         return None, None
 
     if lpfg_result.stderr:
         # LPFG can emit useful warnings to stderr even on success.
         logging.info(f"LPFG message: {lpfg_result.stderr.strip()}")
 
-    leafposition_path = os.path.join(SCRIPT_DIR, "leafposition.dat")
-    project_bin = os.path.join(SCRIPT_DIR, "project")
-    project_src = os.path.join(SCRIPT_DIR, "lsystem", "project.cpp")
+    leafposition_path = os.path.join(worker_ws, "leafposition.dat")
+    project_bin = os.path.join(worker_ws, "project")
+    project_src = os.path.join(worker_ws, "project.cpp")
 
     # 2. Project (Extract geometry to leafposition.dat)
     if not os.path.exists(leafposition_path):
         logging.error("LPFG completed but leafposition.dat was not generated.")
+        import shutil
+        shutil.rmtree(worker_ws, ignore_errors=True)
         return None, None
 
     # 3. Process Geometry
@@ -310,7 +292,7 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
             logging.error(f"Failed to compile project tool: {(compile_result.stderr or '').strip()}")
             return None, None
         
-    output_txt = os.path.join(output_dir, f"output_{temp_id}.txt")
+    output_txt = os.path.join(verify_tmp_dir, f"output_{temp_id}.txt")
     try:
         with open(output_txt, "w") as out_f:
             proj_result = subprocess.run(
@@ -332,13 +314,19 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
         syn_bp, syn_ep = read_syn_plant(output_txt)
         
         # Cleanup temp files
-        if os.path.exists(param_file): os.remove(param_file)
-        if os.path.exists(output_txt): os.remove(output_txt)
+        if os.path.exists(param_file):
+            os.remove(param_file)
+        if os.path.exists(output_txt):
+            os.remove(output_txt)
         if os.path.exists(leafposition_path):
             os.remove(leafposition_path)
+        if os.path.exists(verify_tmp_dir):
+            shutil.rmtree(verify_tmp_dir)
             
         return syn_bp, syn_ep
     except Exception:
+        if os.path.exists(verify_tmp_dir):
+            shutil.rmtree(verify_tmp_dir)
         return None, None
 
 def evaluate_real_cost(syn_bp, syn_ep, real_bp, real_ep):
@@ -533,8 +521,29 @@ def optimize_params_for_model(model, model_type, real_bp_batch, real_ep_batch, a
 
     return best_params, best_cost, restart_records
 
+def _verify_worker_task(task_args):
+    rec, model_output_dir, real_bp, real_ep = task_args
+    restart_idx = rec["restart"]
+    restart_params = rec["params"]
+    restart_surrogate = rec["surrogate_cost"]
+    restart_verify_dir = os.path.join(model_output_dir, "Verify", f"Restart_{restart_idx}")
+    syn_bp, syn_ep = run_simulation_verification(restart_params, restart_verify_dir)
+    if syn_bp:
+        try:
+            restart_real_cost = evaluate_real_cost(syn_bp, syn_ep, real_bp, real_ep)
+            return restart_idx, True, restart_surrogate, restart_real_cost, restart_params
+        except Exception as e:
+            return restart_idx, False, restart_surrogate, float('inf'), restart_params
+    else:
+        return restart_idx, False, restart_surrogate, float('inf'), restart_params
+
 def main():
     parser = argparse.ArgumentParser(description="Optimize Plant Parameters using Surrogate Models")
+    parser.add_argument(
+        "--plant",
+        default="Plant_063-32",
+        help="Target real plant name residing in Real Plants folder",
+    )
     parser.add_argument(
         "--run_dir",
         default=DEFAULT_MODEL_RUN_DIR,
@@ -623,16 +632,19 @@ def main():
     run_output_dir, run_name = create_run_output_dir(args.output_dir)
 
     # 1. Setup
-    log_path = configure_output_file_logging(run_output_dir, run_name)
+    log_path = utils_nn.configure_output_file_logging(run_output_dir, run_name)
     setup_logging(run_output_dir)
     logging.info(f"Terminal Log: {log_path}")
     logging.info(f"Output Directory: {run_output_dir}")
     logging.info(f"Model Search Directory: {args.run_dir}")
     
     # 2. Load Real Data (Target)
-    logging.info("Loading real plant data (Target Structure)...")
+    utils_nn.real_plant_name = args.plant
+    utils_nn.plant_image_path = utils_nn.plant_images_path + args.plant
+    
+    logging.info(f"Loading real plant data (Target Structure) for {args.plant}...")
     real_bp, real_ep = read_real_plants()
-    real_bp_batch, real_ep_batch = prepare_real_plant_batch(real_bp, real_ep)
+    real_bp_batch, real_ep_batch = utils_nn.prepare_real_plant_batch(real_bp, real_ep)
     
     # 3. Find Models to Optimize
     models_to_process = []
@@ -685,24 +697,22 @@ def main():
         verified_restart_rows = []
         if not args.dry_run and args.verify_each_restart and restart_records:
             logging.info("  Running per-restart LPFG verification...")
-            for rec in restart_records:
-                restart_idx = rec["restart"]
-                restart_params = rec["params"]
-                restart_surrogate = rec["surrogate_cost"]
-                restart_verify_dir = os.path.join(model_output_dir, "Verify", f"Restart_{restart_idx}")
-                syn_bp, syn_ep = run_simulation_verification(restart_params, restart_verify_dir)
-                if syn_bp:
-                    restart_real_cost = evaluate_real_cost(syn_bp, syn_ep, real_bp, real_ep)
-                    verified_restart_rows.append((restart_idx, restart_surrogate, restart_real_cost, restart_params))
-                    logging.info(
-                        f"  Restart {restart_idx}/{args.restarts} | "
-                        f"surrogate={restart_surrogate:.4f} | actual={restart_real_cost:.4f}"
-                    )
-                else:
-                    logging.warning(
-                        f"  Restart {restart_idx}/{args.restarts} | "
-                        f"surrogate={restart_surrogate:.4f} | actual=FAILED"
-                    )
+            
+            task_list = [(rec, model_output_dir, real_bp, real_ep) for rec in restart_records]
+            
+            with concurrent.futures.ProcessPoolExecutor() as executor:
+                for idx, success, surrogate_cost_res, real_cost, params in executor.map(_verify_worker_task, task_list):
+                    if success:
+                        verified_restart_rows.append((idx, surrogate_cost_res, real_cost, params))
+                        logging.info(
+                            f"  Restart {idx}/{args.restarts} | "
+                            f"surrogate={surrogate_cost_res:.4f} | actual={real_cost:.4f}"
+                        )
+                    else:
+                        logging.warning(
+                            f"  Restart {idx}/{args.restarts} | "
+                            f"surrogate={surrogate_cost_res:.4f} | actual=FAILED"
+                        )
 
             if verified_restart_rows:
                 best_by_real = min(verified_restart_rows, key=lambda row: row[2])

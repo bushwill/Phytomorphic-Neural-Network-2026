@@ -17,16 +17,20 @@ import torch
 from datetime import datetime
 from numpy.random import normal as nran
 from numpy.random import uniform as uran
+import utils_nn
+from utils_nn import read_real_plants, calculate_cost, plant_images_path, generate_plant, read_syn_plant, build_parameter_file
+import utils_nn as plant_comparison_nn
+import subprocess
+import concurrent.futures
+
+# Prevent docker generated files from locking out host user
+os.umask(0)
 
 # Ensure project modules are in path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    from utils_nn import read_real_plants, calculate_cost, plant_images_path, generate_plant, read_syn_plant, build_parameter_file
-    import utils_nn as plant_comparison_nn
-except ImportError:
-    print("Error: Could not import project modules. Ensure they are in the python path.")
-    sys.exit(1)
+
+
 
 # --- USER CONFIGURATION ---
 # Dataset Generation Parameters
@@ -60,27 +64,6 @@ PARAM_NAMES = [
     "exp_int_rad",
 ]
 
-def configure_output_file_logging(output_dir, run_label):
-    """Route stdout/stderr to a persistent log file when attached to a TTY."""
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
-    stream = open(log_path, "a", buffering=1)
-
-    if sys.stdout.isatty() or sys.stderr.isatty():
-        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
-        try:
-            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
-        except OSError:
-            pass
-
-        os.dup2(stream.fileno(), 1)
-        os.dup2(stream.fileno(), 2)
-        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
-        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
-        print(notice)
-
-    return log_path
-
 def setup_logging(log_file):
     """Configures logging to file and console."""
     logging.basicConfig(
@@ -92,7 +75,7 @@ def setup_logging(log_file):
         ]
     )
 
-def generate_nazifa_random_samples(n_samples):
+def generate_random_samples(n_samples):
     """Generate samples using the exact Nazifa random parameter distribution."""
     samples = np.zeros((n_samples, len(PARAM_NAMES)))
     for i in range(n_samples):
@@ -118,6 +101,108 @@ def generate_nazifa_random_samples(n_samples):
 
     return samples
 
+def _process_sample(args):
+    i, params, split_name, real_bp, real_ep, structures_dir, lsystem_tmp_root = args
+
+    uid = uuid.uuid4().hex[:8]
+    # Give this process its own isolated copy of lsystem to avoid make collisions
+    worker_ws = os.path.join(lsystem_tmp_root, f"worker_{uid}")
+    os.makedirs(worker_ws, exist_ok=True)
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    lsystem_base = os.path.join(script_dir, "lsystem")
+    
+    # Copy essential LPFG files into the isolated worker workspace
+    for item in os.listdir(lsystem_base):
+        src = os.path.join(lsystem_base, item)
+        if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
+            shutil.copy2(src, os.path.join(worker_ws, item))
+
+    # Compile project.cpp in the worker workspace if it doesn't have it
+    if not os.path.exists(os.path.join(worker_ws, "project")):
+        ret = os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
+        if ret != 0:
+            return i, False, "project.cpp compilation failed"
+
+    temp_param_file = os.path.join(worker_ws, f"temp_{split_name}_{uid}.vset")
+    temp_out_dir = os.path.join(worker_ws, f"temp_out_{split_name}_{uid}")
+    os.makedirs(temp_out_dir, exist_ok=True)
+    
+    try:
+        # 1. Generate L-System Structure
+        build_parameter_file(temp_param_file, params)
+        
+        # Build lpfg command components (Using absolute paths inside the worker workspace)
+        abs_output_dir = os.path.abspath(temp_out_dir)
+        abs_param_file = os.path.abspath(temp_param_file)
+        
+        # Function to get lsystem file paths from worker workspace
+        def ls(f): return os.path.join(worker_ws, f)
+
+        # Build lpfg command components 
+        lpfg_args = [
+            "lpfg", 
+            "-w", "306", "256", 
+            ls("lsystem.l"), 
+            ls("view.v"), 
+            ls("materials.mat"), 
+            ls("contours.cset"), 
+            ls("functions.fset"), 
+            ls("functions.tset"), 
+            abs_param_file
+        ]
+
+        # Run lpfg inside the isolated temp_out_dir
+        log_file = os.path.join(abs_output_dir, "lpfg_log.txt")
+        with open(log_file, "w") as f_log:
+            process = subprocess.Popen(lpfg_args, cwd=abs_output_dir, stdout=f_log, stderr=subprocess.STDOUT)
+            process.wait()
+
+        # Run project executable explicitly from worker workspace
+        project_exe = os.path.join(worker_ws, "project")
+        leafval_file = "leafposition.dat" 
+        output_txt = os.path.join(abs_output_dir, "output.txt")
+        
+        with open(output_txt, "w") as f_out:
+            p_args = [project_exe, "2454", "2056", leafval_file]
+            p_proc = subprocess.Popen(p_args, cwd=abs_output_dir, stdout=f_out)
+            p_proc.wait()
+        
+        if not os.path.exists(output_txt):
+            return i, False, "output.txt not generated"
+            
+        syn_bp, syn_ep = read_syn_plant(output_txt)
+        
+        # 2. Calculate Cost
+        total_cost = 0.0
+        num_days = min(len(syn_bp), len(real_bp))
+        
+        if num_days == 0:
+            total_cost = 1e6 # Penalty for empty
+        else:
+            for day in range(num_days):
+                total_cost += calculate_cost(syn_bp[day], syn_ep[day], real_bp[day], real_ep[day])
+
+        # 3. Save Results
+        # Save Structure Tensor
+        struct_data = {
+            "bp": syn_bp,
+            "ep": syn_ep,
+            "params": torch.tensor(params, dtype=torch.float32),
+            "cost": torch.tensor(total_cost, dtype=torch.float32)
+        }
+        torch.save(struct_data, os.path.join(structures_dir, f"structure_{i}.pt"))
+        
+        row = [i, total_cost] + params.tolist()
+        return i, True, row
+
+    except Exception as e:
+        return i, False, str(e)
+    finally:
+        # Clean up isolated worker workspace
+        if 'worker_ws' in locals() and os.path.exists(worker_ws):
+            shutil.rmtree(worker_ws, ignore_errors=True)
+
 def generate_split(split_name, size, real_data, output_dir):
     """Generates a dataset split (Train/Val/Test)."""
     if size <= 0:
@@ -136,71 +221,31 @@ def generate_split(split_name, size, real_data, output_dir):
     with open(csv_path, "w", newline="") as f:
         csv.writer(f).writerow(csv_header)
         
-    # Generate parameters using Nazifa's random distribution.
-    params_array = generate_nazifa_random_samples(size)
+    params_array = generate_random_samples(size)
 
     real_bp, real_ep = real_data
     valid_count = 0
     start_time = time.time()
     
-    # Process Loop
-    for i in range(size):
-        params = params_array[i]
-        
-        # Temporary unique workspace
-        uid = uuid.uuid4().hex[:8]
-        temp_param_file = f"temp_{split_name}_{uid}.vset"
-        temp_out_dir = f"temp_out_{split_name}_{uid}"
-        os.makedirs(temp_out_dir, exist_ok=True)
-        
-        try:
-            # 1. Generate L-System Structure
-            build_parameter_file(temp_param_file, params)
-            generate_plant(temp_param_file, temp_out_dir)
-            
-            output_txt = os.path.join(temp_out_dir, "output.txt")
-            if not os.path.exists(output_txt):
-                continue
-                
-            syn_bp, syn_ep = read_syn_plant(output_txt)
-            
-            # 2. Calculate Cost
-            total_cost = 0.0
-            num_days = min(len(syn_bp), len(real_bp))
-            
-            if num_days == 0:
-                total_cost = 1e6 # Penalty for empty
-            else:
-                for day in range(num_days):
-                    total_cost += calculate_cost(syn_bp[day], syn_ep[day], real_bp[day], real_ep[day])
+    # Keep L-system temp artifacts inside the dedicated lsystem workspace.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    lsystem_tmp_root = os.path.join(script_dir, "lsystem", "tmp", split_name)
+    os.makedirs(lsystem_tmp_root, exist_ok=True)
 
-            # 3. Save Results
-            # Save Structure Tensor
-            struct_data = {
-                "bp": syn_bp,
-                "ep": syn_ep,
-                "params": torch.tensor(params, dtype=torch.float32),
-                "cost": torch.tensor(total_cost, dtype=torch.float32)
-            }
-            torch.save(struct_data, os.path.join(structures_dir, f"structure_{i}.pt"))
+    args_list = [(i, params_array[i], split_name, real_bp, real_ep, structures_dir, lsystem_tmp_root) for i in range(size)]
+
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        for i, success, result in executor.map(_process_sample, args_list):
+            if success:
+                # Save CSV Row serially to avoid exact parallel append conflicts
+                with open(csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow(result)
+                valid_count += 1
+            else:
+                logging.warning(f"  Sample {i} failed: {result}")
             
-            # Save CSV Row
-            with open(csv_path, "a", newline="") as f:
-                row = [i, total_cost] + params.tolist()
-                csv.writer(f).writerow(row)
-                
-            valid_count += 1
             if (i + 1) % 50 == 0:
                 logging.info(f"  Processed {i+1}/{size} samples.")
-
-        except Exception as e:
-            logging.warning(f"  Sample {i} failed: {e}")
-        finally:
-            # Clean up temp files
-            if os.path.exists(temp_param_file):
-                os.remove(temp_param_file)
-            if os.path.exists(temp_out_dir):
-                shutil.rmtree(temp_out_dir)
 
     logging.info(f"Finished {split_name}. Valid: {valid_count}/{size}. Time: {time.time() - start_time:.2f}s")
     return valid_count
@@ -231,24 +276,23 @@ def main():
         base_dir = os.path.join(script_dir, base_dir)
         
     os.makedirs(base_dir, exist_ok=True)
-    log_path = configure_output_file_logging(base_dir, os.path.basename(base_dir))
+    utils_nn.configure_output_file_logging(base_dir, os.path.basename(base_dir))
     setup_logging(os.path.join(base_dir, "generation_log.txt"))
     
     logging.info(f"=== Dataset Generation Started ===")
     logging.info(f"Target Plant: {args.plant}")
     logging.info(f"Output Directory: {base_dir}")
-    logging.info(f"Terminal Log: {log_path}")
-    logging.info("Method: RANDOM (Nazifa distribution)")
+    logging.info(f"Method: RANDOM")
     
     # 1. Load Real Plant Data
     try:
-        plant_comparison_nn.real_plant_name = args.plant
+        # Let read_real_plants handle the plant name
         # Fix for path construction if module var is relative
         if not os.path.isabs(plant_comparison_nn.plant_images_path):
              # Assume relative to module loc or CWD. Let's use as-is but ensure it exists?
              pass
         
-        real_bp, real_ep = read_real_plants()
+        real_bp, real_ep = read_real_plants(args.plant)
         logging.info(f"Loaded real plant data ({len(real_bp)} days).")
         real_data = (real_bp, real_ep)
     except Exception as e:
@@ -264,7 +308,7 @@ def main():
     with open(os.path.join(base_dir, "description.txt"), "w") as f:
         f.write(f"Dataset: {os.path.basename(base_dir)}\n")
         f.write(f"Date: {datetime.now().strftime('%Y-%m-%d')}\n")
-        f.write("Method: random (Nazifa distribution)\n")
+        f.write("Method: random\n")
         f.write(f"Plant: {args.plant}\n")
         f.write(f"Sizes: Train={args.train_size}, Val={args.val_size}, Test={args.test_size}\n")
         f.write("Distribution:\n")
@@ -285,6 +329,4 @@ def main():
     logging.info("Generation Complete.")
 
 if __name__ == "__main__":
-    # Allow host access to created files
-    os.umask(0)
     main()

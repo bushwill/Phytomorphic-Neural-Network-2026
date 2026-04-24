@@ -29,7 +29,7 @@ cd /app/vlab || return
 
 echo "Step 1d: Running postinstall.sh..."
 # Check permission/executable
-chmod +x bin/postinstall.sh
+# chmod +x bin/postinstall.sh (Skipped because Dockerfile sets 777)
 ./bin/postinstall.sh
 
 # Step 2 & 3: Set up VLAB environment directly 

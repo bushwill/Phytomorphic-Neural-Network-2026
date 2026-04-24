@@ -26,6 +26,9 @@ from munkres import Munkres, print_matrix, make_cost_matrix, DISALLOWED
 from concurrent.futures import ThreadPoolExecutor
 from timeit import default_timer as timer
 
+# Force all newly created files and directories from Python to be world-writable
+# This prevents Docker root-owned files from locking out the host OS user.
+os.umask(0)
 
 # --- From plant_comparison_nn.py ---
 
@@ -143,25 +146,55 @@ def parse_dataframe(bin_c):
     return info, ep, bp, length_edge, root
 
 
-def read_real_plants():
+def read_real_plants(plant_name=None):
+    if plant_name is None:
+        plant_name = real_plant_name
+    current_plant_path = plant_images_path + plant_name
 
     real_ep =[]
     real_bp =[]
 
-    for day_real in range(2,28):
+    # 1. Identify all structurally valid days for the plant
+    available_days = []
+    for day_real in range(2, 60): # Search generously forward
         if day_real < 10:
-            image_name = plant_image_path + "/topo/Day_00" + str(
-                day_real) + ".png"
+            test_img = current_plant_path + "/topo/Day_00" + str(day_real) + ".png"
         else:
-            image_name = plant_image_path + "/topo/Day_0" + str(
-                day_real) + ".png"
+            test_img = current_plant_path + "/topo/Day_0" + str(day_real) + ".png"
+        if os.path.exists(test_img):
+            available_days.append(day_real)
+            
+    if not available_days:
+        return real_bp, real_ep # Return empty if totally missing
+        
+    start_day = available_days[0]
+    end_day = available_days[-1]
 
-        image = io.imread(image_name)
-        image_gray = color.rgb2gray(color.rgba2rgb(image))
-        bin = image_gray > 0.1
-        info_c, ep_c, bp_c, length_c, root_c = parse_dataframe(bin)
-        real_bp.append(bp_c)
-        real_ep.append(ep_c)
+    # 2. Extract exactly the valid sequence (Developmental Day 1 to End)
+    # This automatically syncs L-system Day 1 with Image 1, and drops trailing zeros
+    last_valid_bp = []
+    last_valid_ep = []
+    
+    for target_day in range(start_day, end_day + 1):
+        if target_day < 10:
+            image_name = current_plant_path + "/topo/Day_00" + str(target_day) + ".png"
+        else:
+            image_name = current_plant_path + "/topo/Day_0" + str(target_day) + ".png"
+
+        if os.path.exists(image_name):
+            image = io.imread(image_name)
+            image_gray = color.rgb2gray(color.rgba2rgb(image))
+            bin = image_gray > 0.1
+            info_c, ep_c, bp_c, length_c, root_c = parse_dataframe(bin)
+            last_valid_bp = bp_c
+            last_valid_ep = ep_c
+            real_bp.append(bp_c)
+            real_ep.append(ep_c)
+        else:
+            # If a single image is corrupted/missing in the middle of a valid sequence, hold steady
+            if len(last_valid_bp) > 0:
+                real_bp.append(last_valid_bp)
+                real_ep.append(last_valid_ep)
 
     return real_bp, real_ep
 
@@ -185,7 +218,12 @@ def calculate_cost(day_syn_bp, day_syn_ep,  real_bp, real_ep):
             flag = flag + 1
 
     while (flag > 0):
-        distance_cost.append(max(distance_cost))
+        if len(distance_cost) > 0:
+            distance_cost.append(max(distance_cost))
+        else:
+            # If distance_cost is completely empty (e.g. one plant exists, the other does not at all)
+            # Apply a heavy baseline penalty for each unmatched theoretical assignment.
+            distance_cost.append(1000.0) 
         flag = flag - 1
 
     return sum(distance_cost)
@@ -446,7 +484,9 @@ def compute_normalization_stats(num_samples = 100, real_bp=None, real_ep=None):
         real_bp, real_ep = read_real_plants()
     params_collection = []
     cost_collection = []
-    temp_file = "surrogate_params_temp.vset"
+    lsystem_tmp_root = os.path.join("lsystem", "tmp")
+    os.makedirs(lsystem_tmp_root, exist_ok=True)
+    temp_file = os.path.join(lsystem_tmp_root, "surrogate_params_temp.vset")
     for i in range(num_samples):
         clear_surrogate_dir()
         p = build_random_parameter_file(temp_file)
@@ -454,6 +494,8 @@ def compute_normalization_stats(num_samples = 100, real_bp=None, real_ep=None):
         if np.isfinite(c) and c >= 0:
             params_collection.append(p)
             cost_collection.append(c)
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
     return (np.mean(params_collection, axis=0), np.std(params_collection, axis=0),
             np.mean(cost_collection), np.std(cost_collection))
     
@@ -611,7 +653,7 @@ def generate_and_evaluate(param_file, real_bp, real_ep):
     # Run lpfg to generate the synthetic plant
     generateSurrogatePlant(param_file)
     # Read the synthetic plant's endpoints and branchpoints for the latest run
-    syn_bp, syn_ep = read_syn_plant_surrogate()
+    syn_bp, syn_ep = read_syn_plant("data/surrogate/output.txt")
     # Use the first (or only) day's data for cost calculation
     cost = 0
     for i in range(min(len(syn_bp), len(real_bp))):
@@ -648,39 +690,112 @@ def generateSurrogatePlant(param_file, calculate_cost_fn=None):
     
     # If cost calculation function provided, calculate and return cost
     if calculate_cost_fn is not None:
-        syn_bp, syn_ep = read_syn_plant_surrogate()
+        syn_bp, syn_ep = read_syn_plant("data/surrogate/output.txt")
         return calculate_cost_fn(syn_bp, syn_ep)
-def read_syn_plant_surrogate(file_name="data/surrogate/output.txt"):
-    f = open(file_name, "r")
-    lines = f.readlines()
-    day_temp = 0
-    syn_bp = []
-    syn_ep = []
-    syn_bp_day = []
-    syn_ep_day = []
-    day = []
+    
 
-    for line in lines:
-        temp = line.split(" ")
-        if temp[0] == "Day:":
-            day_temp = int(temp[1])
-            if day_temp>2:
-                syn_bp.append(syn_bp_day)
-                syn_ep.append(syn_ep_day)
-                syn_bp_day = []
-                syn_ep_day = []
-        if (temp[0] != "Day:") & (day_temp > 1):
-            if temp[0] == "I":
-                syn_bp_day.append([int(temp[3]), int(temp[2])])
-                day.append(day_temp)
-            else:
-                syn_ep_day.append([int(temp[3]), int(temp[2])])
-                day.append(day_temp)
 
-    if day_temp == 27:
-        syn_bp.append(syn_bp_day)
-        syn_ep.append(syn_ep_day)
+def prepare_real_plant_batch(real_bp, real_ep, max_points=50, use_multiprocessing=True):
+    """
+    Pre-processes real plant data into fixed-size tensors for batching.
+    Moves data to shared memory if multiprocessing is enabled, which is critical
+    for efficient data loading during PyTorch model training.
+    
+    Args:
+        real_bp (list): List of daily branch point lists [Day -> Points].
+        real_ep (list): List of daily end point lists.
+        max_points (int): Maximum number of points to keep per day (padding/truncating).
+        use_multiprocessing (bool): Whether to share the tensor memory.
+        
+    Returns:
+        tuple (torch.Tensor, torch.Tensor): Processed batched tensors 
+                                            of shape (1, num_days, max_points, 2).
+    """
+    import torch
+    num_days = len(real_bp)
+    bp_batch = torch.zeros(1, num_days, max_points, 2)
+    ep_batch = torch.zeros(1, num_days, max_points, 2)
+    
+    for day in range(num_days):
+        # Fill tensors from lists, truncating to max_points
+        if len(real_bp[day]) > 0:
+            count = min(len(real_bp[day]), max_points)
+            bp_batch[0, day, :count, :] = torch.tensor(real_bp[day][:count], dtype=torch.float32)
+        if len(real_ep[day]) > 0:
+            count = min(len(real_ep[day]), max_points)
+            ep_batch[0, day, :count, :] = torch.tensor(real_ep[day][:count], dtype=torch.float32)
+            
+    if use_multiprocessing:
+        bp_batch.share_memory_()
+        ep_batch.share_memory_()
+        
+    return bp_batch, ep_batch
 
-    f.close()
 
-    return syn_bp, syn_ep
+def configure_output_file_logging(output_dir, run_label):
+    """
+    Routes stdout and stderr to a persistent log file.
+    
+    This abstracts logging to consistently capture prints during long containerized
+    runs running in Docker, making sure standard terminal output is saved.
+    """
+    import sys
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
+
+    stream = open(log_path, "a", buffering=1)
+
+    if sys.stdout.isatty() or sys.stderr.isatty():
+        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
+        try:
+            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+
+        os.dup2(stream.fileno(), 1)
+        os.dup2(stream.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        print(notice)
+def load_lsystem_guidance_batch(structures_dir, sample_ids, max_points=50):
+    """
+    Load surrogate-generated final-day L-system point cloud topologies.
+    
+    This function batches synthetic structural outputs to act as a topological 
+    regularizer during neural network training runs, ensuring model predictions 
+    stay grounded within valid L-system biological constraints.
+    """
+    import os
+    import torch
+    batch_size = len(sample_ids)
+    bp_batch = torch.zeros(batch_size, max_points, 2, dtype=torch.float32)
+    ep_batch = torch.zeros(batch_size, max_points, 2, dtype=torch.float32)
+    bp_mask = torch.zeros(batch_size, max_points, dtype=torch.bool)
+    ep_mask = torch.zeros(batch_size, max_points, dtype=torch.bool)
+
+    for row_idx, sample_id in enumerate(sample_ids.tolist()):
+        struct_path = os.path.join(structures_dir, f"structure_{int(sample_id)}.pt")
+        if not os.path.exists(struct_path):
+            continue
+
+        try:
+            struct_data = torch.load(struct_path, map_location="cpu")
+            bp_days = struct_data.get("bp", [])
+            ep_days = struct_data.get("ep", [])
+
+            bp_points = bp_days[-1] if len(bp_days) > 0 else []
+            ep_points = ep_days[-1] if len(ep_days) > 0 else []
+
+            if len(bp_points) > 0:
+                count = min(len(bp_points), max_points)
+                bp_batch[row_idx, :count, :] = torch.as_tensor(bp_points[:count], dtype=torch.float32)
+                bp_mask[row_idx, :count] = True
+
+            if len(ep_points) > 0:
+                count = min(len(ep_points), max_points)
+                ep_batch[row_idx, :count, :] = torch.as_tensor(ep_points[:count], dtype=torch.float32)
+                ep_mask[row_idx, :count] = True
+        except Exception:
+            continue
+
+    return bp_batch, ep_batch, bp_mask, ep_mask

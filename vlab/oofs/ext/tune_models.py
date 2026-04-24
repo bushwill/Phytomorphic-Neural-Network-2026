@@ -29,6 +29,9 @@ from train_models import (
     configure_output_file_logging,
 )
 
+# Keep generated files/dirs editable and removable from host-mounted volumes.
+os.umask(0)
+
 # --- User Configuration ---
 DATASET_NAME = "Run 021926"
 PLANT_NAME = "Plant_063-32"

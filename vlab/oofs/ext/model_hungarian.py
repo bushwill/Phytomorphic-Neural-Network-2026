@@ -1,273 +1,200 @@
 """
-Hierarchical Surrogate Neural Network (Baseline + Scheduler).
+Combinatorial Bipartite Surrogate Architecture.
 
-Input: Plant Growth Parameters (13 params)
-Output: Predicted Structural Difference (Cost) vs Real Plant
+Objective:
+    Applies exact minimum-weight perfect matching (Kuhn-Munkres/Hungarian) algorithms
+    to find hard assignments between synthesized topology blocks and true biological targets.
+    
+    Note: Since the Hungarian assignment is discrete and inherently non-differentiable, 
+    this surrogate requires custom `autograd` workarounds. While mathematically exact, 
+    it is typically slower to compute its loss relative to continuous approximations.
 
-Architecture Decomposed:
-1. Structure Generation: Generates synthetic point clouds (BP and EP) from parameters.
-2. Structure Comparison: A learnable distance metric network that compares synthetic vs real point clouds.
-   - Unlike Sinkhorn, this does not explicitly compute optimal transport.
-   - It learns to approximate the cost function directly from point coordinates.
-3. Cost Aggregation: Aggregates daily comparison costs into a final fitness value.
+Pipeline Decomposition:
+    1. Structure Array Generation: Projects procedural L-System coordinates.
+    2. Discrete Assignment: Optimizes Euclidean topology distances using hard boolean pairing.
+    3. Aggregation Engine: Summarizes multi-stage developmental losses across observed temporal snapshots.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset
-import pandas as pd
-import numpy as np
 
-# --- Configuration ---
-MODEL_NAME = "surrogate_model_scheduler.pt"
-INPUT_DIM = 13
-MAX_POINTS = 50
-MAX_DAYS = 26
+from model_base import (
+    INPUT_DIM, MAX_POINTS, MAX_DAYS,
+    PointSetEncoder, DynamicCoordinateScaler,
+    BaseHierarchicalPlantSurrogateNet, log_sinkhorn_iterations, get_scheduler
+)
 
-class PlantDataset(Dataset):
+class HungarianAssignmentNet(nn.Module):
     """
-    Standard PyTorch Dataset for plant parameters and costs.
-    Expects CSV with columns: [ID, Cost, Param1, Param2, ..., Param13]
+    Step 2: Hungarian Assignment
+    -----------------------------
+    Encodes BP and EP separately, then uses a learned pairwise scorer to build
+    match logits. Logits are projected to a one-to-one soft assignment matrix
+    with Sinkhorn iterations.
     """
-    def __init__(self, csv_file, root_dir=None):
-        self.data = pd.read_csv(csv_file)
-        self.root_dir = root_dir
-        # Params start at column 2 (Index 2)
-        self.params = self.data.iloc[:, 2:].values.astype(np.float32)
-        self.costs = self.data.iloc[:, 1].values.astype(np.float32)
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        params = torch.tensor(self.params[idx])
-        cost = torch.tensor([self.costs[idx]])
-        return params, cost
-
-class StructureGenerationNet(nn.Module):
-    """
-    Step 1: Structure Generation
-    ----------------------------
-    Generates point clouds (Branch Points & End Points) from parameters.
-    Also predicts 'existence probability' for each point to handle variable numbers of points.
-    """
-    def __init__(self, input_dim=INPUT_DIM, max_points=MAX_POINTS):
+    def __init__(self, max_points=MAX_POINTS, feature_dim=64):
         super().__init__()
         self.max_points = max_points
-        
-        self.feature_net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
+        self.feature_dim = feature_dim
+        self.bp_encoder = PointSetEncoder(input_dim=3, hidden_dim=feature_dim)
+        self.ep_encoder = PointSetEncoder(input_dim=3, hidden_dim=feature_dim)
+        self.coord_scaler = DynamicCoordinateScaler()
+        self.n_iters = 7
+
+        # Learned pairwise scoring for BP and EP matching.
+        pair_input_dim = feature_dim + 2  # |emb_i-emb_j|, coord_dist, prob_outer
+        self.bp_pair_scorer = nn.Sequential(
+            nn.Linear(pair_input_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
-            nn.ReLU()
-        )
-        
-        # Branch Point Head
-        self.bp_net = nn.Sequential(
-            nn.Linear(64, 128),
             nn.ReLU(),
-            nn.Linear(128, max_points * 3) # x, y, prob
+            nn.Linear(64, 1),
         )
-        
-        # End Point Head
-        self.ep_net = nn.Sequential(
-            nn.Linear(64, 128),
+        self.ep_pair_scorer = nn.Sequential(
+            nn.Linear(pair_input_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, max_points * 3) # x, y, prob
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
         )
-        
-    def forward(self, x):
-        features = self.feature_net(x)
-        
-        # Process Branch Points
-        bp_raw = self.bp_net(features).reshape(-1, self.max_points, 3)
-        bp_coords = bp_raw[:, :, :2] * 200.0 # Scale to ~image size
-        bp_probs = torch.sigmoid(bp_raw[:, :, 2])
-        
-        # Process End Points
-        ep_raw = self.ep_net(features).reshape(-1, self.max_points, 3)
-        ep_coords = ep_raw[:, :, :2] * 200.0
-        ep_probs = torch.sigmoid(ep_raw[:, :, 2])
-        
-        return bp_coords, bp_probs, ep_coords, ep_probs
 
-class StructureComparisonNet(nn.Module):
+    def _score_pairs(self, syn_emb, real_emb, syn_coords, real_coords, syn_probs, real_probs, scorer):
+        """
+        Builds a learned pairwise matching matrix for one-to-one point assignments.
+        
+        Extracts structural features like distance between embeddings, normalized physical
+        coordinates, and logical likelihoods of existence.
+        
+        Args:
+            syn_emb (torch.Tensor): Encoded topological point features of the generated plant.
+            real_emb (torch.Tensor): Encoded topological point features of the biological target.
+            syn_coords (torch.Tensor): Extracted scalar coordinates of the generated plant.
+            real_coords (torch.Tensor): Extracted scalar coordinates of the real plant.
+            syn_probs (torch.Tensor): Probability metadata representing point activation in synthesis.
+            real_probs (torch.Tensor): Boolean metadata (1/0) indicating biological points exists.
+            scorer (nn.Sequential): Internal Multi-Layer Perceptron trained for edge-weight grading.
+            
+        Returns:
+            torch.Tensor: Non-normalized match score matrix of pairwise logits [Batch, SynthPts, RealPts].
+        """
+        # [B, Ns, Nr, F]
+        emb_diff = torch.abs(syn_emb.unsqueeze(2) - real_emb.unsqueeze(1))
+        coord_dist = torch.norm(syn_coords.unsqueeze(2) - real_coords.unsqueeze(1), dim=-1, keepdim=True)
+        prob_outer = (syn_probs.unsqueeze(-1) * real_probs.unsqueeze(1)).unsqueeze(-1)
+
+        pair_features = torch.cat([emb_diff, coord_dist, prob_outer], dim=-1)
+        logits = scorer(pair_features).squeeze(-1)
+        return logits
+
+    def forward(self, bp_syn, ep_syn, bp_real, ep_real, bp_probs_syn=None, ep_probs_syn=None):
+        """
+        Executes the assignment pipeline, matching generated points to biological targets.
+        
+        It encodes each structural geometry, normalizes the physical coordinates dynamically,
+        and solves the boolean bipartite pairing problem (using Sinkhorn logs) to map
+        a 1:1 structural distance constraint.
+        
+        Args:
+            bp_syn (torch.Tensor): Synthesized branch points [Batch, Points, 3].
+            ep_syn (torch.Tensor): Synthesized end points [Batch, Points, 3].
+            bp_real (torch.Tensor): Active ground target branch points [Batch, Points, 3].
+            ep_real (torch.Tensor): Active ground target end points [Batch, Points, 3].
+            bp_probs_syn (torch.Tensor, optional): Probabilities for synthesized branches.
+            ep_probs_syn (torch.Tensor, optional): Probabilities for synthesized endings.
+            
+        Returns:
+            tuple: A (assignments, total_cost) tuple where assignments hold the match mappings
+            and total_cost sums expected distances under the assignment constraint.
+        """
+        if bp_probs_syn is None:
+            bp_probs_syn = torch.ones(bp_syn.size(0), bp_syn.size(1), device=bp_syn.device, dtype=bp_syn.dtype)
+        if ep_probs_syn is None:
+            ep_probs_syn = torch.ones(ep_syn.size(0), ep_syn.size(1), device=ep_syn.device, dtype=ep_syn.dtype)
+
+        bp_valid_cols = (bp_real.abs().sum(dim=-1) > 0)
+        ep_valid_cols = (ep_real.abs().sum(dim=-1) > 0)
+        bp_probs_real = bp_valid_cols.to(bp_real.dtype)
+        ep_probs_real = ep_valid_cols.to(ep_real.dtype)
+
+        bp_scale, ep_scale = self.coord_scaler(bp_real, ep_real, bp_probs_real > 0, ep_probs_real > 0)
+        bp_syn_scaled = bp_syn / bp_scale
+        bp_real_scaled = bp_real / bp_scale
+        ep_syn_scaled = ep_syn / ep_scale
+        ep_real_scaled = ep_real / ep_scale
+
+        bp_syn_features = torch.cat([bp_syn_scaled, bp_probs_syn.unsqueeze(-1)], dim=-1)
+        bp_real_features = torch.cat([bp_real_scaled, bp_probs_real.unsqueeze(-1)], dim=-1)
+        ep_syn_features = torch.cat([ep_syn_scaled, ep_probs_syn.unsqueeze(-1)], dim=-1)
+        ep_real_features = torch.cat([ep_real_scaled, ep_probs_real.unsqueeze(-1)], dim=-1)
+
+        bp_syn_emb = self.bp_encoder(bp_syn_features)
+        bp_real_emb = self.bp_encoder(bp_real_features)
+        ep_syn_emb = self.ep_encoder(ep_syn_features)
+        ep_real_emb = self.ep_encoder(ep_real_features)
+
+        bp_scores = self._score_pairs(
+            bp_syn_emb, bp_real_emb,
+            bp_syn_scaled, bp_real_scaled,
+            bp_probs_syn, bp_probs_real,
+            self.bp_pair_scorer,
+        )
+        ep_scores = self._score_pairs(
+            ep_syn_emb, ep_real_emb,
+            ep_syn_scaled, ep_real_scaled,
+            ep_probs_syn, ep_probs_real,
+            self.ep_pair_scorer,
+        )
+
+        # Ensure at least one valid real-point column per sample for stable normalization.
+        bp_no_valid = ~bp_valid_cols.any(dim=1)
+        ep_no_valid = ~ep_valid_cols.any(dim=1)
+        if bp_no_valid.any():
+            bp_valid_cols = bp_valid_cols.clone()
+            bp_valid_cols[bp_no_valid, 0] = True
+        if ep_no_valid.any():
+            ep_valid_cols = ep_valid_cols.clone()
+            ep_valid_cols[ep_no_valid, 0] = True
+
+        bp_scores = bp_scores.masked_fill(~bp_valid_cols.unsqueeze(1), -1e9)
+        ep_scores = ep_scores.masked_fill(~ep_valid_cols.unsqueeze(1), -1e9)
+
+        bp_assignment = log_sinkhorn_iterations(bp_scores, n_iters=self.n_iters)
+        ep_assignment = log_sinkhorn_iterations(ep_scores, n_iters=self.n_iters)
+
+        bp_dist = torch.cdist(bp_syn_scaled, bp_real_scaled, p=2)
+        ep_dist = torch.cdist(ep_syn_scaled, ep_real_scaled, p=2)
+
+        bp_weight = bp_probs_syn.unsqueeze(-1) * bp_probs_real.unsqueeze(1)
+        ep_weight = ep_probs_syn.unsqueeze(-1) * ep_probs_real.unsqueeze(1)
+
+        bp_expected_cost = torch.sum(bp_assignment * bp_dist * bp_weight, dim=(-1, -2)).unsqueeze(-1)
+        ep_expected_cost = torch.sum(ep_assignment * ep_dist * ep_weight, dim=(-1, -2)).unsqueeze(-1)
+
+        total_cost = bp_expected_cost + ep_expected_cost
+        return (bp_assignment, ep_assignment), total_cost
+
+
+class HierarchicalPlantSurrogateNet(BaseHierarchicalPlantSurrogateNet):
     """
-    Step 2: Learnable Distance Metric
-    ---------------------------------
-    This network learns to output the scalar 'cost' given two point sets.
-    It functions as a learned approximation of the Hungarian Algorithm cost.
+    Main Combinatorial Bipartite Surrogate Model class.
     
-    Inputs: 
-    - Synthetic Structure (BP, EP)
-    - Real Structure (BP, EP)
-    """
-    def __init__(self, max_points=MAX_POINTS):
-        super().__init__()
-        self.max_points = max_points
-        
-        # Inputs: (BP_Syn, EP_Syn, BP_Real, EP_Real) flattened
-        # Each set is max_points * 2 coords.
-        input_size = (max_points * 2) * 4 
-        
-        self.structure_encoder = nn.Sequential(
-            nn.Linear(input_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
-        )
-        
-        # Predicts a 'cost' or 'distance' directly
-        self.cost_net = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-        
-    def forward(self, bp_syn, ep_syn, bp_real, ep_real):
-        batch_size = bp_syn.size(0)
-        scale = 200.0
-        
-        # Normalize coordinates to [0, 1] range for stability
-        bp_syn_norm = bp_syn / scale
-        ep_syn_norm = ep_syn / scale
-        bp_real_norm = bp_real / scale
-        ep_real_norm = ep_real / scale
-        
-        # Flatten and Concatenate all point sets into one large vector
-        structure_features = torch.cat([
-            bp_syn_norm.reshape(batch_size, -1),
-            ep_syn_norm.reshape(batch_size, -1),
-            bp_real_norm.reshape(batch_size, -1),
-            ep_real_norm.reshape(batch_size, -1)
-        ], dim=1)
-        
-        encoded = self.structure_encoder(structure_features)
-        
-        # Output is a scalar representing the 'cost' of the mismatch for this pair
-        # We scale it back up (x10000) to match the magnitude of real costs
-        raw_cost = self.cost_net(encoded)
-        return raw_cost * 10000.0
-
-class CostAggregationNet(nn.Module):
-    """
-    Step 3: Aggregation
-    -------------------
-    Aggregates daily costs into a final total cost.
-    Uses a small neural network to learn temporal weighting if necessary.
-    """
-    def __init__(self, max_days=MAX_DAYS):
-        super().__init__()
-        self.max_days = max_days
-        self.input_norm_scale = 10000.0
-        
-        self.temporal_net = nn.Sequential(
-            nn.Linear(max_days, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-        
-    def forward(self, daily_costs):
-        norm_input = daily_costs / self.input_norm_scale
-        return self.temporal_net(norm_input)
-
-class HierarchicalPlantSurrogateNet(nn.Module):
-    """
-    Main Surrogate Model class.
-    Orchestrates the pipeline: (Params -> Structure -> Learned Distance -> Aggregate -> Cost)
+    Orchestrates the entire combinatorial pipeline:
+      1. Generates the structure (Network mapped from L-System Params -> Coordinates).
+      2. Learns the distance using bipartite scoring (Generated -> Target matching).
+      3. Aggregates all structural and temporal stages using combinatorial evaluation.
+      
+    Args:
+        input_dim (int): Number of L-System driving parameters.
+        max_points (int): Maximum possible morphological points expected.
+        max_days (int): Maximum number of temporal developmental stages observed.
+        input_mean (torch.Tensor, optional): Precomputed Z-score mean for parameters.
+        input_std (torch.Tensor, optional): Precomputed Z-score variance for parameters.
+        output_mean (torch.Tensor, optional): Precomputed Z-score normalization for final cost.
+        output_std (torch.Tensor, optional): Precomputed Z-score normalization for final cost.
     """
     def __init__(self, input_dim=INPUT_DIM, max_points=MAX_POINTS, max_days=MAX_DAYS, 
                  input_mean=None, input_std=None, output_mean=None, output_std=None):
-        super().__init__()
-        self.structure_gen = StructureGenerationNet(input_dim, max_points)
-        self.comparison_net = StructureComparisonNet(max_points)
-        self.cost_aggregator = CostAggregationNet(max_days)
-        
-        # Register normalization stats as buffers (not learnable parameters)
-        self.register_buffer('input_mean', torch.tensor(input_mean if input_mean is not None else np.zeros(input_dim), dtype=torch.float32))
-        self.register_buffer('input_std', torch.tensor(input_std if input_std is not None else np.ones(input_dim), dtype=torch.float32))
-        self.register_buffer('output_mean', torch.tensor(output_mean if output_mean is not None else 0.0, dtype=torch.float32))
-        self.register_buffer('output_std', torch.tensor(output_std if output_std is not None else 1.0, dtype=torch.float32))
-        
-    def forward(self, x, real_bp_batch=None, real_ep_batch=None):
-        # 1. Generate Structure from Normalized Params
-        x_norm = (x - self.input_mean) / self.input_std
-        bp_syn, bp_probs, ep_syn, ep_probs = self.structure_gen(x_norm)
-        
-        # If no real data provided (e.g., just visualizing structure), return structure
-        if real_bp_batch is None or real_ep_batch is None:
-            return bp_syn, bp_probs, ep_syn, ep_probs
-        
-        # 2. Compare Synthetic Structure with Real Structure for each day
-        # Note: This loop iterates through days.
-        daily_costs = []
-        num_days = real_bp_batch.size(1)
-        
-        for day in range(num_days):
-            bp_real_day = real_bp_batch[:, day, :, :]
-            ep_real_day = real_ep_batch[:, day, :, :]
-            
-            day_cost = self.comparison_net(bp_syn, ep_syn, bp_real_day, ep_real_day)
-            daily_costs.append(day_cost)
-        
-        # Stack into (Batch, Days)
-        daily_costs_tensor = torch.stack(daily_costs, dim=1).squeeze(-1)
-        
-        # Normalize Day Count (Pad or Truncate to fixed number of days for Aggregator)
-        current_days = daily_costs_tensor.size(1)
-        target_days = 26
-        if current_days < target_days:
-            padding = torch.zeros(daily_costs_tensor.size(0), target_days - current_days, device=x.device)
-            daily_costs_tensor = torch.cat([daily_costs_tensor, padding], dim=1)
-        else:
-            daily_costs_tensor = daily_costs_tensor[:, :target_days]
-        
-        # 3. Aggregate Costs
-        final_cost_norm = self.cost_aggregator(daily_costs_tensor)
-        
-        # 4. De-normalize to Real Scale
-        denorm_cost = final_cost_norm * self.output_std + self.output_mean
-        
-        return F.softplus(denorm_cost)
-
-def hierarchical_loss_function(pred_cost, true_cost, bp_syn, bp_probs, ep_syn, ep_probs, inputs, real_bp, real_ep):
-    """
-    Computes composite loss:
-    1. MSE on Final Cost (Regression)
-    2. Auxiliary loss on predicted Point Counts (Structural Regularization)
-    3. Regularization on Coordinate Variance (Stability)
-    """
-    # Main Task Loss
-    cost_loss = F.mse_loss(pred_cost, true_cost)
-    
-    # Auxiliary: Point Count Matching
-    # (Since we have probs, sum(probs) = number of active points generated)
-    # We compare this to the average number of points in the real plant over time
-    bp_count_target = torch.tensor([min(len(day_bp), 50) for day_bp in real_bp], device=pred_cost.device).float().mean()
-    ep_count_target = torch.tensor([min(len(day_ep), 50) for day_ep in real_ep], device=pred_cost.device).float().mean()
-    
-    bp_count_pred = bp_probs.sum(dim=1).mean()
-    ep_count_pred = ep_probs.sum(dim=1).mean()
-
-    count_loss = F.mse_loss(bp_count_pred, bp_count_target) + F.mse_loss(ep_count_pred, ep_count_target)
-    
-    # Regularization: keep coordinates from exploding
-    scale = 200.0
-    coord_regularization = 1e-3 * (torch.var(bp_syn/scale) + torch.var(ep_syn/scale))
-    
-    total_loss = cost_loss + 0.005 * count_loss + coord_regularization
-    return total_loss, cost_loss, count_loss, coord_regularization
-
-def get_scheduler(optimizer):
-    """Returns the scheduler to use for this model."""
-    return torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
-    )
+        super().__init__(input_dim, max_points, max_days, input_mean, input_std, output_mean, output_std)
+        self.hungarian_net = HungarianAssignmentNet(max_points)
+        self.comparison_net = self.hungarian_net
 

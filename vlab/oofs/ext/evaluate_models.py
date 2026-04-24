@@ -37,27 +37,6 @@ from train_models import prepare_real_plant_batch
 # Set umask to 0 so that files created inside docker are accessible on host
 os.umask(0)
 
-def configure_output_file_logging(output_dir, run_label):
-    """Route stdout/stderr to a persistent log file when attached to a TTY."""
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, f"{run_label}_terminal_output.log")
-    stream = open(log_path, "a", buffering=1)
-
-    if sys.stdout.isatty() or sys.stderr.isatty():
-        notice = f"[Logging] Redirecting stdout/stderr to {log_path}"
-        try:
-            os.write(1, (notice + "\n").encode("utf-8", errors="replace"))
-        except OSError:
-            pass
-
-        os.dup2(stream.fileno(), 1)
-        os.dup2(stream.fileno(), 2)
-        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
-        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
-        print(notice)
-
-    return log_path
-
 # --- Configuration ---
 DEFAULT_DATASET_NAME = "Run 021926"
 DEFAULT_MODEL_RUN_DIR = "Training Data/Run_033126"
@@ -529,10 +508,9 @@ def main():
     run_name = os.path.basename(os.path.normpath(model_run_dir))
     output_base_dir = os.path.join(script_dir, "Evaluation Results")
     log_dir = os.path.join(output_base_dir, run_name)
-    log_path = configure_output_file_logging(log_dir, "evaluate_models")
+    utils_nn.configure_output_file_logging(log_dir, "evaluate_models")
 
     print(f"Model Directory (Weights): {model_run_dir}")
-    print(f"Terminal Log: {log_path}")
 
     # Load Data Globals
     current_dir = script_dir

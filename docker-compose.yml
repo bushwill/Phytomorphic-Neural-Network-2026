@@ -7,6 +7,7 @@ services:
     command: tail -f /dev/null
     ports:
       - "6080:6080"
+    user: "1001:1001"
     volumes:
       - ./vlab/oofs/ext:/app/vlab/oofs/ext
     restart: unless-stopped
@@ -19,6 +20,7 @@ services:
     command: tail -f /dev/null
     ports:
       - "6081:6080"
+    user: "1001:1001"
     volumes:
       - ./vlab/oofs/ext:/app/vlab/oofs/ext
     restart: unless-stopped
@@ -31,6 +33,7 @@ services:
     command: tail -f /dev/null
     ports:
       - "6082:6080"
+    user: "1001:1001"
     volumes:
       - ./vlab/oofs/ext:/app/vlab/oofs/ext
     restart: unless-stopped
