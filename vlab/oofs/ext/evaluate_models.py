@@ -136,8 +136,8 @@ def plot_parameter_importance(model, test_loader, device, output_dir, real_bp_ba
     
     with torch.no_grad():
         for params, costs in test_loader:
-            all_params.append(params)
-            all_targets.append(costs)
+            all_params.append(torch.atleast_1d(params))
+            all_targets.append(torch.atleast_1d(costs))
             
     X = torch.cat(all_params).to(device)
     y = torch.cat(all_targets).to(device)
@@ -216,8 +216,8 @@ def plot_predictions(model, test_loader, device, output_dir, real_bp_batch, real
             curr_ep = real_ep_batch.repeat(bs, 1, 1, 1).to(device)
             
             pred = model(params, curr_bp, curr_ep)
-            preds_list.append(pred.cpu())
-            targets_list.append(costs)
+            preds_list.append(torch.atleast_1d(pred.cpu()))
+            targets_list.append(torch.atleast_1d(costs))
             
     preds = torch.cat(preds_list).numpy().flatten()
     targets = torch.cat(targets_list).numpy().flatten()
@@ -348,8 +348,8 @@ def compute_test_metrics(model, test_loader, device, real_bp_batch, real_ep_batc
             curr_ep = real_ep_batch.repeat(bs, 1, 1, 1).to(device)
             
             pred = model(params, curr_bp, curr_ep)
-            all_preds.append(pred)
-            all_targets.append(costs.to(device))
+            all_preds.append(torch.atleast_1d(pred))
+            all_targets.append(torch.atleast_1d(costs.to(device)))
             
     preds = torch.cat(all_preds).squeeze()
     targets = torch.cat(all_targets).squeeze()

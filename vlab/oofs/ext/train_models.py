@@ -287,8 +287,8 @@ def validate(model, loader, real_bp_batch, real_ep_batch):
             # Forward
             pred = model(params, curr_bp, curr_ep) # Returns Real-Scale Cost
             
-            all_preds_list.append(pred)
-            all_targets_list.append(costs)
+            all_preds_list.append(torch.atleast_1d(pred))
+            all_targets_list.append(torch.atleast_1d(costs))
             
     all_preds = torch.cat(all_preds_list, dim=0).squeeze()
     all_targets = torch.cat(all_targets_list, dim=0).squeeze()

@@ -105,30 +105,31 @@ def _process_sample(args):
     i, params, split_name, real_bp, real_ep, structures_dir, lsystem_tmp_root = args
 
     uid = uuid.uuid4().hex[:8]
-    # Give this process its own isolated copy of lsystem to avoid make collisions
-    worker_ws = os.path.join(lsystem_tmp_root, f"worker_{uid}")
-    os.makedirs(worker_ws, exist_ok=True)
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    lsystem_base = os.path.join(script_dir, "lsystem")
-    
-    # Copy essential LPFG files into the isolated worker workspace
-    for item in os.listdir(lsystem_base):
-        src = os.path.join(lsystem_base, item)
-        if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
-            shutil.copy2(src, os.path.join(worker_ws, item))
-
-    # Compile project.cpp in the worker workspace if it doesn't have it
-    if not os.path.exists(os.path.join(worker_ws, "project")):
-        ret = os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
-        if ret != 0:
-            return i, False, "project.cpp compilation failed"
-
-    temp_param_file = os.path.join(worker_ws, f"temp_{split_name}_{uid}.vset")
-    temp_out_dir = os.path.join(worker_ws, f"temp_out_{split_name}_{uid}")
-    os.makedirs(temp_out_dir, exist_ok=True)
-    
+    worker_ws = None
     try:
+        # Give this process its own isolated copy of lsystem to avoid make collisions
+        worker_ws = os.path.join(lsystem_tmp_root, f"worker_{uid}")
+        os.makedirs(worker_ws, exist_ok=True)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        lsystem_base = os.path.join(script_dir, "lsystem")
+
+        # Copy essential LPFG files into the isolated worker workspace
+        for item in os.listdir(lsystem_base):
+            src = os.path.join(lsystem_base, item)
+            if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
+                shutil.copy2(src, os.path.join(worker_ws, item))
+
+        # Compile project.cpp in the worker workspace if it doesn't have it
+        if not os.path.exists(os.path.join(worker_ws, "project")):
+            ret = os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
+            if ret != 0:
+                return i, False, "project.cpp compilation failed"
+
+        temp_param_file = os.path.join(worker_ws, f"temp_{split_name}_{uid}.vset")
+        temp_out_dir = os.path.join(worker_ws, f"temp_out_{split_name}_{uid}")
+        os.makedirs(temp_out_dir, exist_ok=True)
+
         # 1. Generate L-System Structure
         build_parameter_file(temp_param_file, params)
         
@@ -200,7 +201,7 @@ def _process_sample(args):
         return i, False, str(e)
     finally:
         # Clean up isolated worker workspace
-        if 'worker_ws' in locals() and os.path.exists(worker_ws):
+        if worker_ws and os.path.exists(worker_ws):
             shutil.rmtree(worker_ws, ignore_errors=True)
 
 def generate_split(split_name, size, real_data, output_dir):

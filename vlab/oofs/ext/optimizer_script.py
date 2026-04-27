@@ -207,93 +207,80 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
     Runs the actual LPFG simulation with the optimized parameters
     to verify the 'True Cost' vs. the 'Predicted Cost'.
     """
+    worker_ws = None
+    param_file = None
+    output_txt = None
+    leafposition_path = None
+    verify_tmp_dir = None
     os.makedirs(output_dir, exist_ok=True)
-    temp_id = uuid.uuid4().hex[:6]
-    lsystem_dir = os.path.join(SCRIPT_DIR, "lsystem")
-    verify_tmp_root = os.path.join(lsystem_dir, "verify_tmp")
-    os.makedirs(verify_tmp_root, exist_ok=True)
-    worker_ws = os.path.join(verify_tmp_root, f"worker_{temp_id}")
-    os.makedirs(worker_ws, exist_ok=True)
-    
-    # Copy essential files to an isolated workspace for this worker
-    for item in os.listdir(lsystem_dir):
-        src = os.path.join(lsystem_dir, item)
-        if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
-            import shutil
-            shutil.copy2(src, os.path.join(worker_ws, item))
-
-    # Recompile project.cpp safely in the isolated path safely if necessary
-    if not os.path.exists(os.path.join(worker_ws, "project")):
-        os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
-        
-    verify_tmp_dir = os.path.join(worker_ws, f"run_{temp_id}")
-    os.makedirs(verify_tmp_dir, exist_ok=True)
-    param_file = os.path.join(worker_ws, f"opt_{temp_id}.vset")
-    
-    # Write parameters to file.
-    build_parameter_file(param_file, params.tolist())
-    
-    # 1. LPFG (Generate Structure)
-    # Assumes 'lpfg' is in PATH or otherwise discoverable by the shell.
-    lsystem_l = os.path.join(worker_ws, "lsystem.l")
-    view_v = os.path.join(worker_ws, "view.v")
-    materials_mat = os.path.join(worker_ws, "materials.mat")
-    contours_cset = os.path.join(worker_ws, "contours.cset")
-    functions_fset = os.path.join(worker_ws, "functions.fset")
-    functions_tset = os.path.join(worker_ws, "functions.tset")
-
-    lpfg_cmd = [
-        "lpfg", "-w", "306", "256",
-        lsystem_l, view_v, materials_mat,
-        contours_cset, functions_fset, functions_tset,
-        param_file,
-    ]
-    
     try:
+        temp_id = uuid.uuid4().hex[:6]
+        lsystem_dir = os.path.join(SCRIPT_DIR, "lsystem")
+        verify_tmp_root = os.path.join(lsystem_dir, "verify_tmp")
+        os.makedirs(verify_tmp_root, exist_ok=True)
+        worker_ws = os.path.join(verify_tmp_root, f"worker_{temp_id}")
+        os.makedirs(worker_ws, exist_ok=True)
+        
+        # Copy essential files to an isolated workspace for this worker
+        for item in os.listdir(lsystem_dir):
+            src = os.path.join(lsystem_dir, item)
+            if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
+                shutil.copy2(src, os.path.join(worker_ws, item))
+
+        # Recompile project.cpp safely in the isolated path if necessary
+        if not os.path.exists(os.path.join(worker_ws, "project")):
+            os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
+            
+        verify_tmp_dir = os.path.join(worker_ws, f"run_{temp_id}")
+        os.makedirs(verify_tmp_dir, exist_ok=True)
+        param_file = os.path.join(worker_ws, f"opt_{temp_id}.vset")
+        
+        # Write parameters to file.
+        build_parameter_file(param_file, params.tolist())
+        
+        # 1. LPFG (Generate Structure)
+        # Assumes 'lpfg' is in PATH or otherwise discoverable by the shell.
+        lsystem_l = os.path.join(worker_ws, "lsystem.l")
+        view_v = os.path.join(worker_ws, "view.v")
+        materials_mat = os.path.join(worker_ws, "materials.mat")
+        contours_cset = os.path.join(worker_ws, "contours.cset")
+        functions_fset = os.path.join(worker_ws, "functions.fset")
+        functions_tset = os.path.join(worker_ws, "functions.tset")
+
+        lpfg_cmd = [
+            "lpfg", "-w", "306", "256",
+            lsystem_l, view_v, materials_mat,
+            contours_cset, functions_fset, functions_tset,
+            param_file,
+        ]
+        
         # We explicitly run CWD into this isolated environment and wait sequentially
         lpfg_result = subprocess.run(lpfg_cmd, capture_output=True, text=True, check=True, cwd=worker_ws)
-    except FileNotFoundError:
-        logging.error("LPFG execution failed. Ensure 'lpfg' is in PATH.")
-        import shutil
-        shutil.rmtree(worker_ws, ignore_errors=True)
-        return None, None
-    except subprocess.CalledProcessError as e:
-        stderr_msg = (e.stderr or "").strip()
-        if stderr_msg:
-            logging.error(f"LPFG execution failed: {stderr_msg}")
-        else:
-            logging.error("LPFG execution failed with non-zero exit code.")
-        import shutil
-        shutil.rmtree(worker_ws, ignore_errors=True)
-        return None, None
 
-    if lpfg_result.stderr:
-        # LPFG can emit useful warnings to stderr even on success.
-        logging.info(f"LPFG message: {lpfg_result.stderr.strip()}")
+        if lpfg_result.stderr:
+            # LPFG can emit useful warnings to stderr even on success.
+            logging.info(f"LPFG message: {lpfg_result.stderr.strip()}")
 
-    leafposition_path = os.path.join(worker_ws, "leafposition.dat")
-    project_bin = os.path.join(worker_ws, "project")
-    project_src = os.path.join(worker_ws, "project.cpp")
+        leafposition_path = os.path.join(worker_ws, "leafposition.dat")
+        project_bin = os.path.join(worker_ws, "project")
+        project_src = os.path.join(worker_ws, "project.cpp")
 
-    # 2. Project (Extract geometry to leafposition.dat)
-    if not os.path.exists(leafposition_path):
-        logging.error("LPFG completed but leafposition.dat was not generated.")
-        import shutil
-        shutil.rmtree(worker_ws, ignore_errors=True)
-        return None, None
-
-    # 3. Process Geometry
-    # This requires the 'project' binary (compiled from C++).
-    if not os.path.exists(project_bin):
-        logging.info("Compiling 'project' tool (one-time)...")
-        compile_cmd = ["g++", "-o", project_bin, "-Wall", "-Wextra", project_src, "-lm"]
-        compile_result = subprocess.run(compile_cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
-        if compile_result.returncode != 0:
-            logging.error(f"Failed to compile project tool: {(compile_result.stderr or '').strip()}")
+        # 2. Project (Extract geometry to leafposition.dat)
+        if not os.path.exists(leafposition_path):
+            logging.error("LPFG completed but leafposition.dat was not generated.")
             return None, None
-        
-    output_txt = os.path.join(verify_tmp_dir, f"output_{temp_id}.txt")
-    try:
+
+        # 3. Process Geometry
+        # This requires the 'project' binary (compiled from C++).
+        if not os.path.exists(project_bin):
+            logging.info("Compiling 'project' tool (one-time)...")
+            compile_cmd = ["g++", "-o", project_bin, "-Wall", "-Wextra", project_src, "-lm"]
+            compile_result = subprocess.run(compile_cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
+            if compile_result.returncode != 0:
+                logging.error(f"Failed to compile project tool: {(compile_result.stderr or '').strip()}")
+                return None, None
+            
+        output_txt = os.path.join(verify_tmp_dir, f"output_{temp_id}.txt")
         with open(output_txt, "w") as out_f:
             proj_result = subprocess.run(
                 [project_bin, "2454", "2056", leafposition_path],
@@ -305,29 +292,26 @@ def run_simulation_verification(params, output_dir="Optimizer Data/Verify"):
             )
             if proj_result.stderr:
                 logging.info(f"project message: {proj_result.stderr.strip()}")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"project failed: {(e.stderr or '').strip()}")
-        return None, None
-    
-    # 4. Read Data
-    try:
-        syn_bp, syn_ep = read_syn_plant(output_txt)
         
-        # Cleanup temp files
-        if os.path.exists(param_file):
-            os.remove(param_file)
-        if os.path.exists(output_txt):
-            os.remove(output_txt)
-        if os.path.exists(leafposition_path):
-            os.remove(leafposition_path)
-        if os.path.exists(verify_tmp_dir):
-            shutil.rmtree(verify_tmp_dir)
-            
+        # 4. Read Data
+        syn_bp, syn_ep = read_syn_plant(output_txt)
         return syn_bp, syn_ep
-    except Exception:
-        if os.path.exists(verify_tmp_dir):
-            shutil.rmtree(verify_tmp_dir)
+    except FileNotFoundError:
+        logging.error("LPFG execution failed. Ensure 'lpfg' is in PATH.")
         return None, None
+    except subprocess.CalledProcessError as e:
+        stderr_msg = (e.stderr or "").strip()
+        if stderr_msg:
+            logging.error(f"LPFG execution failed: {stderr_msg}")
+        else:
+            logging.error("LPFG execution failed with non-zero exit code.")
+        return None, None
+    except Exception as e:
+        logging.error(f"Verification failed: {e}")
+        return None, None
+    finally:
+        if worker_ws and os.path.exists(worker_ws):
+            shutil.rmtree(worker_ws, ignore_errors=True)
 
 def evaluate_real_cost(syn_bp, syn_ep, real_bp, real_ep):
     """Calculates the structural cost between generated (syn) and real plant data."""

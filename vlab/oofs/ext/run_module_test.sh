@@ -1,0 +1,123 @@
+#!/bin/bash
+
+# ==============================================================================
+# Phytomorphic Neural Network Orchestration Pipeline
+# Module Ablation Test (Encoder, Scaler, Aggregator)
+# ==============================================================================
+
+# --- 1. CONFIGURATION ---
+
+# Experiment Tag (Override with $1 if provided)
+EXPERIMENT_TAG="${1:-$(date +%m%d%y_%H%M%S)}"
+
+# Define the biological targets
+PLANTS=(
+    "Plant_063-32"
+)
+
+# Experimental scales mapping to: Train Val Test
+# The module test uses the largest scale to clearly separate model capabilities
+DATASET_SPECS=(
+    "50000 5000 10000"
+)
+
+# Number of Replicate runs per configuration for statistical smoothing
+REPLICATES="${REPLICATES:-3}"
+
+# Models to evaluate (space separated list for argument forwarding)
+# sinkhorn = Full model (baseline for comparison)
+# sinkhorn_no_encoder = Replaces PointNet/Encoder with simple MLP
+# sinkhorn_no_scaler = Removes scaling parameter module logic
+# sinkhorn_no_aggregator = Removes the final aggregator module in favor of an MLP pool
+MODELS="sinkhorn sinkhorn_no_encoder sinkhorn_no_scaler sinkhorn_no_aggregator"
+
+# ==============================================================================
+# SCRIPT EXECUTION
+# ==============================================================================
+set -e # Exit immediately on error
+umask 000 # Forces global Umask to 000 so outputs remain editable by host user
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "============================================================"
+echo " Starting Sinkhorn Module Ablation / Module Testing"
+echo "============================================================"
+echo "Experiment Tag: $EXPERIMENT_TAG"
+echo "Plants:         ${PLANTS[*]}"
+echo "Models:         $MODELS"
+echo "Replicates:     $REPLICATES"
+echo "Dataset Specs:  ${DATASET_SPECS[*]}"
+echo "============================================================"
+
+for PLANT_NAME in "${PLANTS[@]}"; do
+    
+    OPT_ROOT_REL="Optimizer Data/Experiment_${EXPERIMENT_TAG}/${PLANT_NAME}"
+    mkdir -m 777 -p "${OPT_ROOT_REL}"
+
+    for spec in "${DATASET_SPECS[@]}"; do
+        read -r train_size val_size test_size <<< "$spec"
+        dataset_name="${PLANT_NAME}-${train_size}_${val_size}_${test_size}"
+        dataset_dir="Datasets/${dataset_name}"
+        training_run_name="ModuleTest_${EXPERIMENT_TAG}_${dataset_name}"
+        training_run_dir="Training Data/${training_run_name}"
+        optimizer_out_rel="${OPT_ROOT_REL}/${dataset_name}"
+
+        echo
+        echo "------------------------------------------------------------"
+        echo " Processing Config -> Plant: $PLANT_NAME | Spec: $spec"
+        echo "------------------------------------------------------------"
+        echo "Optimizer root: ${OPT_ROOT_REL}"
+        
+        # --- Stage 1: Dataset Generation ---
+        echo "Checking for dataset: ${dataset_name}..."
+        if [[ ! -f "${dataset_dir}/Train.csv" || ! -f "${dataset_dir}/Validation.csv" || ! -f "${dataset_dir}/Test.csv" ]]; then
+            echo "Dataset missing or incomplete. Automatically generating it now..."
+            mkdir -m 777 -p "${dataset_dir}"
+            python3 generate_dataset.py \
+                --plant "$PLANT_NAME" \
+                --train_size "$train_size" \
+                --val_size "$val_size" \
+                --test_size "$test_size" \
+                --output_dir "${dataset_dir}"
+        else
+            echo "Dataset fully generated. Skipping generation step."
+        fi
+
+        # --- Stage 2: Model Training ---
+        echo
+        echo "[1/2] Training module test models on dataset: ${dataset_name}"
+        # using unquoted $MODELS so bash splits it into separate positional arguments
+        python3 train_models.py \
+            --dataset "$dataset_name" \
+            --plant "$PLANT_NAME" \
+            --run-name "$training_run_name" \
+            --replicates "$REPLICATES" \
+            --models $MODELS \
+            --skip-evaluation
+
+        if [[ ! -d "$training_run_dir" ]]; then
+            echo "ERROR: Could not determine training output directory for ${dataset_name}."
+            echo "Expected training directory: ${training_run_dir}"
+            exit 1
+        fi
+        echo "Training run dir: ${training_run_dir}"
+
+        # --- Stage 3: Surrogate Optimization ---
+        echo
+        echo "[2/2] Optimizing trained module test models from: ${training_run_dir}"
+        python3 optimizer_script.py \
+            --run_dir "$training_run_dir" \
+            --plant "$PLANT_NAME" \
+            --models $MODELS \
+            --output_dir "$optimizer_out_rel"
+
+    done
+done
+
+echo
+echo "============================================================"
+echo " Module Test Experiments Complete!"
+echo " Root Training runs directory: ${SCRIPT_DIR}/Training Data"
+echo " Root Optimizer outputs: ${SCRIPT_DIR}/Optimizer Data/Experiment_${EXPERIMENT_TAG}"
+echo "============================================================"
