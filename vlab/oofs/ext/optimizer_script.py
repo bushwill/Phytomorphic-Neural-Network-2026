@@ -52,6 +52,22 @@ except ImportError as e:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+LSYSTEM_PARAM_NAMES = [
+    "max_phytomers",
+    "plastochron",
+    "plant_roll_angle",
+    "plant_down_angle",
+    "branch_angle",
+    "leaf_len",
+    "exp_leaf_wid",
+    "leaf_wid",
+    "leaf_bend_scale",
+    "leaf_twist_scale",
+    "node_len",
+    "int_wid",
+    "exp_int_rad",
+]
+
 # --- Configuration Constants ---
 # Edit these defaults to control optimizer behavior without touching CLI args.
 DEFAULT_MODEL_RUN_DIR = "Training Data/Run_041326"
@@ -394,9 +410,15 @@ def build_optimizer_summaries(run_output_dir):
                 "verified_sim_cost": float(record.get("verified_sim_cost", "nan")),
             }
 
-            for key, value in record.items():
-                if key.startswith("param_"):
-                    row[key] = float(value)
+            for idx, name in enumerate(LSYSTEM_PARAM_NAMES):
+                named_key = f"opt_{name}"
+                legacy_key = f"param_{idx}"
+                if named_key in record and record[named_key] != "":
+                    row[named_key] = float(record[named_key])
+                    row[legacy_key] = float(record[named_key])
+                elif legacy_key in record and record[legacy_key] != "":
+                    row[legacy_key] = float(record[legacy_key])
+                    row[named_key] = float(record[legacy_key])
 
             result_rows.append(row)
         except Exception as e:
@@ -408,7 +430,7 @@ def build_optimizer_summaries(run_output_dir):
 
     result_rows.sort(key=lambda item: (item["model_family"], item["run_variant"], item["relative_path"]))
 
-    param_keys = sorted([key for key in result_rows[0].keys() if key.startswith("param_")], key=lambda x: int(x.split("_")[1]))
+    param_keys = [f"opt_{name}" for name in LSYSTEM_PARAM_NAMES]
     summary_path = os.path.join(run_output_dir, "summary_results.csv")
     fieldnames = ["model_family", "run_variant", "relative_path", "surrogate_pred_cost", "verified_sim_cost"] + param_keys
 
@@ -755,9 +777,12 @@ def main():
             
             with open(out_file, "w", newline="") as f:
                 writer = csv.writer(f)
-                header = ["surrogate_pred_cost", "verified_sim_cost"] + [f"param_{i}" for i in range(len(best_params))]
+                legacy_headers = [f"param_{i}" for i in range(len(best_params))]
+                named_headers = [f"opt_{name}" for name in LSYSTEM_PARAM_NAMES]
+                header = ["surrogate_pred_cost", "verified_sim_cost"] + legacy_headers + named_headers
                 writer.writerow(header)
-                row = [surrogate_cost, real_cost] + best_params.tolist()
+                param_values = best_params.detach().cpu().view(-1).tolist()
+                row = [surrogate_cost, real_cost] + param_values + param_values
                 writer.writerow(row)
             logging.info(f"Results saved to {out_file}")
 

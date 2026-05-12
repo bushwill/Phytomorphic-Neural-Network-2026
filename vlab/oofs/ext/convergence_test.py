@@ -24,15 +24,32 @@ from collections import defaultdict
 from statistics import mean, stdev
 from datetime import datetime
 
+OPT_PARAM_NAMES = [
+    "max_phytomers",
+    "plastochron",
+    "plant_roll_angle",
+    "plant_down_angle",
+    "branch_angle",
+    "leaf_len",
+    "exp_leaf_wid",
+    "leaf_wid",
+    "leaf_bend_scale",
+    "leaf_twist_scale",
+    "node_len",
+    "int_wid",
+    "exp_int_rad",
+]
+
 
 def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
     """
-    Parse all Tuning_* directories created during convergence testing.
+    Parse all tuning result directories (looks for tuning_summary.csv).
     
-    Extracts model, fraction, R², cost, and hyperparameter data from tuning_summary.csv.
+    Searches for tuning_summary.csv files in base_dir and its subdirectories.
+    Works with both traditional Tuning_* structure and direct model folder structures.
     
     Args:
-        base_dir (str): Base directory containing Tuning_* subdirectories
+        base_dir (str): Base directory to search for tuning results
         
     Returns:
         dict: Results keyed by (model, fraction, epochs) with lists of replicate data
@@ -42,9 +59,10 @@ def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
     if not os.path.exists(base_dir):
         return results
     
-    # Find all Tuning_* directories
-    for tuning_dir in sorted(glob.glob(os.path.join(base_dir, "Tuning_*"))):
-        tuning_csv = os.path.join(tuning_dir, "tuning_summary.csv")
+    # Find all tuning_summary.csv files recursively
+    csv_files = glob.glob(os.path.join(base_dir, "**/tuning_summary.csv"), recursive=True)
+    
+    for tuning_csv in sorted(csv_files):
         if not os.path.exists(tuning_csv):
             continue
         
@@ -62,6 +80,7 @@ def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
                 results[key].append({
                     'r2': float(row['best_val_r2']),
                     'cost': float(row['best_lpfg_cost']),
+                    'surrogate_cost': float(row.get('best_lpfg_surrogate_cost', 'nan')),
                     'epochs': epochs,
                     'fraction': frac,
                     'learning_rate': float(row['learning_rate']),
@@ -70,6 +89,11 @@ def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
                     'epochs_trained': int(row['epochs_trained']),
                     'lr': float(row['learning_rate']),
                     'bs': int(row['batch_size']),
+                    'opt_params': {
+                        name: float(row[f'opt_{name}'])
+                        for name in OPT_PARAM_NAMES
+                        if f'opt_{name}' in row and row[f'opt_{name}'] != ''
+                    },
                 })
     
     return results
@@ -110,6 +134,53 @@ def generate_convergence_summary(results, summary_file):
         by_model_frac = defaultdict(lambda: defaultdict(list))
         for (model, frac, epochs), data_list in results.items():
             by_model_frac[model][frac].append((epochs, data_list))
+        
+        # OPTIMIZED HYPERPARAMETER SETS
+        f.write("="*150 + "\n")
+        f.write("OPTIMIZED HYPERPARAMETER SETS\n")
+        f.write("="*150 + "\n\n")
+        
+        models = sorted(set(k[0] for k in results.keys()))
+        for model in models:
+            f.write(f"\nMODEL: {model.upper()}\n")
+            f.write(f"{'-'*150}\n\n")
+            
+            # Get unique HP sets for this model
+            hp_sets = set()
+            for (m, frac, epochs), data_list in results.items():
+                if m == model:
+                    for data in data_list:
+                        hp_key = (data['lr'], data['bs'])
+                        hp_sets.add(hp_key)
+            
+            hp_sets = sorted(hp_sets)
+            
+            # For each HP set, show results across all fractions and epochs
+            for lr, bs in hp_sets:
+                f.write(f"  Hyperparameter Set: LR={lr:.1e}, BS={bs}\n")
+                f.write(f"  {'-'*146}\n")
+                f.write(f"  {'Fraction':<12} {'Epochs':<10} {'Avg R²':<12} {'Std R²':<12} {'R² Vector':<80}\n")
+                f.write(f"  {'-'*146}\n")
+                
+                fractions = sorted(set(k[1] for k in results.keys() if k[0] == model))
+                for frac in fractions:
+                    epochs_list = sorted(set(k[2] for k in results.keys() if k[0] == model and k[1] == frac))
+                    for epochs in epochs_list:
+                        key = (model, frac, epochs)
+                        if key in results:
+                            data_list = [d for d in results[key] if d['lr'] == lr and d['bs'] == bs]
+                            if data_list:
+                                r2_vals = sorted([d['r2'] for d in data_list])
+                                avg_r2 = mean(r2_vals)
+                                std_r2 = stdev(r2_vals) if len(r2_vals) > 1 else 0
+                                r2_str = " ".join(f"{v:.4f}" for v in r2_vals)
+                                
+                                frac_pct = f"{frac*100:.0f}%"
+                                f.write(f"  {frac_pct:<12} {epochs:<10} {avg_r2:<12.4f} {std_r2:<12.4f} {r2_str:<80}\n")
+                
+                f.write("\n")
+        
+        f.write("\n")
         
         # DETAILED ANALYSIS BY MODEL
         for model in sorted(by_model_frac.keys()):
@@ -158,6 +229,23 @@ def generate_convergence_summary(results, summary_file):
                     for data in sorted(data_list, key=lambda x: x['replicate']):
                         est_samples = int(20000 * frac)
                         f.write(f"    {data['replicate']:<5} {data['r2']:<12.4f} {data['cost']:<15.1f} {data['lr']:<10.1e} {data['bs']:<5} {est_samples:<15,}\n")
+                
+                f.write(f"\n  OPTIMIZED L-SYSTEM PARAMETER SETS (per replicate):\n")
+                f.write(f"  {'-'*140}\n")
+                
+                for epochs, data_list in epoch_list:
+                    f.write(f"\n    Epochs: {epochs}\n")
+                    for data in sorted(data_list, key=lambda x: x['replicate']):
+                        opt_params = data.get('opt_params', {})
+                        if opt_params:
+                            param_vector = " | ".join(
+                                f"{name}={opt_params[name]:.6f}" for name in OPT_PARAM_NAMES if name in opt_params
+                            )
+                        else:
+                            param_vector = "(not recorded)"
+                        f.write(
+                            f"    Rep {data['replicate']}: R²={data['r2']:.4f} | Cost={data['cost']:.1f} | {param_vector}\n"
+                        )
                 
                 f.write("\n")
             

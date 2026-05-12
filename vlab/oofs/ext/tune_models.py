@@ -23,6 +23,23 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 import torch.multiprocessing as mp
 
+# Keep the optimized 13-parameter L-system names aligned with dataset generation.
+LSYSTEM_PARAM_NAMES = [
+    "max_phytomers",
+    "plastochron",
+    "plant_roll_angle",
+    "plant_down_angle",
+    "branch_angle",
+    "leaf_len",
+    "exp_leaf_wid",
+    "leaf_wid",
+    "leaf_bend_scale",
+    "leaf_twist_scale",
+    "node_len",
+    "int_wid",
+    "exp_int_rad",
+]
+
 # Import model definitions
 try:
     import model_base
@@ -67,6 +84,14 @@ class TeeStream:
     def flush(self):
         for stream in self.streams:
             stream.flush()
+
+
+def _params_to_list(best_params):
+    if best_params is None:
+        return []
+    if torch.is_tensor(best_params):
+        return [float(value) for value in best_params.detach().cpu().view(-1).tolist()]
+    return [float(value) for value in best_params]
 
 
 def attach_transcript(log_path):
@@ -303,6 +328,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
         f.write("epoch,train_loss,val_mse,val_r2,opt_surrogate_cost,opt_real_lpfg_cost,time_sec\n")
         
     best_lpfg_cost = float('inf')
+    best_lpfg_params = None
+    best_lpfg_surrogate_cost = float('inf')
     best_val_r2 = -float('inf')
     patience_counter = 0
     total_epochs_trained = 0
@@ -358,6 +385,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
 
         if real_lpfg_cost < best_lpfg_cost:
             best_lpfg_cost = real_lpfg_cost
+            best_lpfg_params = best_params.detach().cpu().view(-1).clone()
+            best_lpfg_surrogate_cost = float(opt_cost)
             patience_counter = 0
             torch.save(model.state_dict(), best_model_path)
             print(f"[{unique_run_name}] * New best LPFG score achieved! Saving model.")
@@ -415,6 +444,36 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             target_value = float(test_loader_report["targets"][idx])
             rf.write(f"{pred_value:.10f},{target_value:.10f},{(target_value - pred_value):.10f}\n")
 
+    if best_lpfg_params is not None:
+        optimized_params_path = os.path.join(model_dir, "optimized_params.csv")
+        with open(optimized_params_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "model",
+                "replicate",
+                "dataset",
+                "plant",
+                "dataset_fraction",
+                "epochs_trained",
+                "best_val_r2",
+                "best_lpfg_cost",
+                "best_lpfg_surrogate_cost",
+                *LSYSTEM_PARAM_NAMES,
+            ])
+            writer.writerow([
+                config["name"],
+                replicate_id,
+                args.dataset,
+                args.plant,
+                args.dataset_fraction,
+                total_epochs_trained,
+                f"{best_val_r2:.6f}",
+                f"{best_lpfg_cost:.6f}",
+                f"{best_lpfg_surrogate_cost:.6f}",
+                *[f"{value:.10f}" for value in _params_to_list(best_lpfg_params)],
+            ])
+            print(f"[{unique_run_name}] Saved optimized L-system parameters -> {optimized_params_path}")
+
     # Log final summary line for this replicate so we don't have to rewrite aggregate_results() completely
     summary_csv = os.path.join(run_dir, "tuning_summary.csv")
     write_header = not os.path.exists(summary_csv)
@@ -422,12 +481,31 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     with open(summary_csv, "a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(["model", "replicate", "learning_rate", "batch_size", 
-                             "dataset_fraction", "epochs_trained", "best_val_r2", "best_lpfg_cost"])
+            writer.writerow([
+                "model",
+                "replicate",
+                "learning_rate",
+                "batch_size",
+                "dataset_fraction",
+                "epochs_trained",
+                "best_val_r2",
+                "best_lpfg_cost",
+                "best_lpfg_surrogate_cost",
+                *[f"opt_{name}" for name in LSYSTEM_PARAM_NAMES],
+            ])
         writer.writerow([
-            config["name"], replicate_id, config["learning_rate"], config["batch_size"],
-            args.dataset_fraction, total_epochs_trained, f"{best_val_r2:.6f}", f"{best_lpfg_cost:.6f}"
+            config["name"],
+            replicate_id,
+            config["learning_rate"],
+            config["batch_size"],
+            args.dataset_fraction,
+            total_epochs_trained,
+            f"{best_val_r2:.6f}",
+            f"{best_lpfg_cost:.6f}",
+            f"{best_lpfg_surrogate_cost:.6f}",
+            *[f"{value:.10f}" for value in _params_to_list(best_lpfg_params)],
         ])
+    print(f"[{unique_run_name}] Updated tuning summary -> {summary_csv}")
     # Create a DONE marker so resumed runs can skip completed replicates
     try:
         done_path = os.path.join(model_dir, "DONE")

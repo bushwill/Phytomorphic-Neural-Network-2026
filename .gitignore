@@ -4,4 +4,5 @@ vlab/oofs/ext/Optimizer Data
 vlab/oofs/ext/Training Data
 vlab/oofs/ext/l-system images
 vlab/oofs/ext/Hyperparameter Tuning
+vlab/oofs/ext/Convergence Tests
 vlab/oofs/ext/__pycache__

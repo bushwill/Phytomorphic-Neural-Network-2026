@@ -36,7 +36,17 @@ PLANT_NAME="Plant_023-1"
 DATASET_SIZE="20000 4000 10000"  # Train Val Test
 read -r TRAIN_SIZE VAL_SIZE TEST_SIZE <<< "$DATASET_SIZE"
 DATASET_NAME="${PLANT_NAME}-${TRAIN_SIZE}_${VAL_SIZE}_${TEST_SIZE}"
-DATASET_DIR="Convergence Tests/Datasets/${DATASET_NAME}"
+
+# Check for dataset in original location first, then convergence tests location
+ORIGINAL_DATASET_DIR="Datasets/${DATASET_NAME}"
+CONVERGENCE_DATASET_DIR="Convergence Tests/Datasets/${DATASET_NAME}"
+
+# Use original location if it exists, otherwise use convergence tests location
+if [[ -f "${ORIGINAL_DATASET_DIR}/Train.csv" ]]; then
+    DATASET_DIR="$ORIGINAL_DATASET_DIR"
+else
+    DATASET_DIR="$CONVERGENCE_DATASET_DIR"
+fi
 
 # Best HP sets from tuning (one per model)
 # MLP best: lr0.001_bs1 (R²=0.988128±0.001123, cost=57,327±5,331 on large data)
@@ -73,6 +83,17 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 CONVERGENCE_DIR="Convergence Tests/Convergence_${TIMESTAMP}_${PLANT_NAME}"
 mkdir -m 777 -p "$CONVERGENCE_DIR"
 
+# Convergence tuning results go directly in convergence folder (no HP Tuning subdirectory)
+TUNING_BASE_DIR="$CONVERGENCE_DIR"
+
+# Verify directory was created
+if [[ ! -d "$CONVERGENCE_DIR" ]]; then
+    echo "ERROR: Failed to create convergence directory: $CONVERGENCE_DIR"
+    exit 1
+fi
+
+echo "✓ Created convergence directory: $CONVERGENCE_DIR"
+
 CONVERGENCE_SUMMARY="${CONVERGENCE_DIR}/convergence_summary.txt"
 
 echo ""
@@ -87,6 +108,7 @@ echo "MLP Config:         lr${MLP_LR} bs${MLP_BS}"
 echo "Sinkhorn Config:    lr${SINKHORN_LR} bs${SINKHORN_BS}"
 echo "Replicates:         $REPLICATES"
 echo "Output Dir:         $CONVERGENCE_DIR"
+echo "Tuning Dir:         $TUNING_BASE_DIR"
 echo "============================================================"
 echo ""
 
@@ -138,7 +160,11 @@ for frac in "${FRACTIONS[@]}"; do
             --epochs "$max_epochs" \
             --patience "$patience" \
             --opt-restarts "$OPT_RESTARTS" \
-            --opt-steps "$OPT_STEPS"
+            --opt-steps "$OPT_STEPS" \
+            --tuning-dir "$TUNING_BASE_DIR" || {
+            echo "  [ERROR] MLP test failed"
+            exit 1
+        }
         
         sleep 1
         
@@ -155,13 +181,22 @@ for frac in "${FRACTIONS[@]}"; do
             --epochs "$max_epochs" \
             --patience "$patience" \
             --opt-restarts "$OPT_RESTARTS" \
-            --opt-steps "$OPT_STEPS"
+            --opt-steps "$OPT_STEPS" \
+            --tuning-dir "$TUNING_BASE_DIR" || {
+            echo "  [ERROR] Sinkhorn test failed"
+            exit 1
+        }
         
         sleep 1
         
         echo ""
     done
 done
+
+echo ""
+echo "Checking convergence directory contents after tuning runs:"
+find "$CONVERGENCE_DIR" -type f -name "tuning_summary.csv" 2>/dev/null | head -20 || echo "  (No tuning_summary.csv files found)"
+echo ""
 
 # ==============================================================================
 # POST-PROCESSING: GENERATE CONVERGENCE SUMMARY
@@ -174,8 +209,9 @@ echo "============================================================"
 echo ""
 
 export CONVERGENCE_SUMMARY
+export TUNING_BASE_DIR
 
-python3 convergence_test.py --summary-file "$CONVERGENCE_SUMMARY"
+python3 convergence_test.py --summary-file "$CONVERGENCE_SUMMARY" --tuning-dir "$TUNING_BASE_DIR"
 
 # ==============================================================================
 # FINAL REPORT
