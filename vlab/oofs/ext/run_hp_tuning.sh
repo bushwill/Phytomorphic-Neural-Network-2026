@@ -11,8 +11,6 @@
 # Define the biological targets to target for the structure reference
 PLANTS=(
     "Plant_023-1"
-    "Plant_063-32"
-    "Plant_191-28"
 )
 
 # Experimental scales mapping to: Train Val Test

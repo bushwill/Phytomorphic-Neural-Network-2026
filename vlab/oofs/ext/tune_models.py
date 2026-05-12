@@ -10,7 +10,9 @@ import sys
 import time
 import argparse
 import itertools
+import shutil
 import numpy as np
+import pandas as pd
 import random
 import csv
 from datetime import datetime
@@ -150,7 +152,6 @@ def load_data(dataset_name, plant_name):
     val_csv = os.path.join(dataset_dir, "Validation.csv")
     test_csv = os.path.join(dataset_dir, "Test.csv")
     
-    import pandas as pd
     try:
         df = pd.read_csv(train_csv)
     except FileNotFoundError:
@@ -186,6 +187,53 @@ def load_data(dataset_name, plant_name):
         "dataset_dir": dataset_dir 
     }
 
+def evaluate_loader_r2(model, loader, real_bp_batch, real_ep_batch):
+    """Evaluate a loader and return the vectors used for R2 plus summary stats."""
+    model.eval()
+    all_preds_list = []
+    all_targets_list = []
+
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 3:
+                params, costs, _ = batch
+            else:
+                params, costs = batch
+
+            batch_size = params.size(0)
+            curr_bp = real_bp_batch.repeat(batch_size, 1, 1, 1)
+            curr_ep = real_ep_batch.repeat(batch_size, 1, 1, 1)
+
+            pred = model(params, curr_bp, curr_ep)
+            all_preds_list.append(torch.atleast_1d(pred).detach().cpu())
+            all_targets_list.append(torch.atleast_1d(costs).detach().cpu())
+
+    all_preds = torch.cat(all_preds_list, dim=0).squeeze()
+    all_targets = torch.cat(all_targets_list, dim=0).squeeze()
+
+    target_mean = torch.mean(all_targets)
+    ss_tot = torch.sum((all_targets - target_mean) ** 2)
+    ss_res = torch.sum((all_targets - all_preds) ** 2)
+    r2 = 1 - (ss_res / (ss_tot + 1e-8))
+
+    return {
+        "preds": all_preds,
+        "targets": all_targets,
+        "target_mean": target_mean,
+        "ss_tot": ss_tot,
+        "ss_res": ss_res,
+        "r2": r2,
+    }
+
+def reset_verify_dir(model_dir, unique_run_name):
+    """Remove any stale Verify folder before starting a replicate."""
+    verify_dir = os.path.join(model_dir, "Verify")
+    if os.path.isdir(verify_dir):
+        print(f"[{unique_run_name}] Resetting stale Verify folder: {verify_dir}")
+        shutil.rmtree(verify_dir)
+    os.makedirs(verify_dir, exist_ok=True)
+    return verify_dir
+
 def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, test_ds_args, args, replicate_id=1):
     """
     Train a model instance. Every epoch, evaluate its optimization utility via a lightweight surrogate run.
@@ -211,6 +259,9 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     log_status(f"[Worker] Starting {unique_run_name} | Seed={current_seed} | Plant={args.plant} | Dataset={args.dataset} | LR={config['learning_rate']} | Batch={config['batch_size']} | Fraction={args.dataset_fraction}")
     log_status(f"[Worker] Transcript: {transcript_path}")
 
+    # If a previous attempt left verification artifacts behind, clear them so this run starts clean.
+    verify_dir = reset_verify_dir(model_dir, unique_run_name)
+
     PlantDataset = config["dataset_class"]
     train_ds = PlantDataset(*train_ds_args)
     val_ds = PlantDataset(*val_ds_args)
@@ -230,6 +281,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
 
     log_csv = os.path.join(model_dir, "tuning_log.csv")
     best_model_path = os.path.join(model_dir, "best_model.pt")
+    best_val_model_path = os.path.join(model_dir, "best_val_model.pt")
     log_status(f"[Worker] Active output dir: {model_dir}")
     
     # Initialize Model
@@ -279,8 +331,6 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
         )
         
         # Verify physically with LPFG
-        verify_dir = os.path.join(model_dir, "Verify")
-        os.makedirs(verify_dir, exist_ok=True)
         syn_bp, syn_ep = run_simulation_verification(best_params, output_dir=verify_dir)
         
         real_lpfg_cost = float('inf')
@@ -299,6 +349,12 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
         # 4. Early Stopping strictly on Real LPFG Cost
         if val_metrics['r2'] > best_val_r2:
             best_val_r2 = val_metrics['r2']
+            # Save a snapshot of the model with the best validation R2
+            try:
+                torch.save(model.state_dict(), best_val_model_path)
+                print(f"[{unique_run_name}] Saved best-val model (R2={best_val_r2:.4f}) -> {best_val_model_path}")
+            except Exception:
+                pass
 
         if real_lpfg_cost < best_lpfg_cost:
             best_lpfg_cost = real_lpfg_cost
@@ -318,6 +374,47 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     log_status(f"[Worker] Finished {unique_run_name}. Best LPFG Score: {best_lpfg_cost:.4f} | Best R2: {best_val_r2:.4f}")
     transcript_handle.flush()
 
+    # Final test-set R2 report with the exact vectors used in the calculation.
+    # Prefer the model that achieved the best validation R2 for reporting consistency
+    model_to_load = None
+    if os.path.exists(best_val_model_path):
+        model_to_load = best_val_model_path
+    elif os.path.exists(best_model_path):
+        model_to_load = best_model_path
+
+    if model_to_load is None:
+        print(f"[{unique_run_name}] No saved model found to evaluate test R2.")
+        transcript_handle.flush()
+        return
+
+    model.load_state_dict(torch.load(model_to_load, map_location="cpu"))
+    test_loader_report = evaluate_loader_r2(
+        model.cpu(),
+        test_loader,
+        data["real_bp_batch"].to("cpu"),
+        data["real_ep_batch"].to("cpu"),
+    )
+    test_r2_report_path = os.path.join(model_dir, "test_r2_report.txt")
+    sample_count = min(10, test_loader_report["preds"].numel())
+    with open(test_r2_report_path, "w") as rf:
+        rf.write(f"model={config['name']}\n")
+        rf.write(f"replicate={replicate_id}\n")
+        rf.write(f"dataset={args.dataset}\n")
+        rf.write(f"plant={args.plant}\n")
+        rf.write(f"loaded_model={os.path.basename(model_to_load)}\n")
+        rf.write(f"split=test\n")
+        rf.write(f"num_points={test_loader_report['targets'].numel()}\n")
+        rf.write(f"target_mean={float(test_loader_report['target_mean']):.10f}\n")
+        rf.write(f"ss_tot={float(test_loader_report['ss_tot']):.10f}\n")
+        rf.write(f"ss_res={float(test_loader_report['ss_res']):.10f}\n")
+        rf.write(f"r2={float(test_loader_report['r2']):.10f}\n")
+        rf.write("\nfirst_vectors\n")
+        rf.write("pred,target,diff\n")
+        for idx in range(sample_count):
+            pred_value = float(test_loader_report["preds"][idx])
+            target_value = float(test_loader_report["targets"][idx])
+            rf.write(f"{pred_value:.10f},{target_value:.10f},{(target_value - pred_value):.10f}\n")
+
     # Log final summary line for this replicate so we don't have to rewrite aggregate_results() completely
     summary_csv = os.path.join(run_dir, "tuning_summary.csv")
     write_header = not os.path.exists(summary_csv)
@@ -331,6 +428,13 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             config["name"], replicate_id, config["learning_rate"], config["batch_size"],
             args.dataset_fraction, total_epochs_trained, f"{best_val_r2:.6f}", f"{best_lpfg_cost:.6f}"
         ])
+    # Create a DONE marker so resumed runs can skip completed replicates
+    try:
+        done_path = os.path.join(model_dir, "DONE")
+        with open(done_path, "w") as df:
+            df.write(f"Completed: {datetime.now().isoformat()}\n")
+    except Exception:
+        pass
 
 def main():
     parser = argparse.ArgumentParser(description="End-to-End Surrogate Tuning")
@@ -345,6 +449,8 @@ def main():
     parser.add_argument("--opt-steps", type=int, default=200, help="Optimizer steps per evaluation restart")
     parser.add_argument("--learning-rates", type=float, nargs="+", default=[1e-3, 5e-4], help="Space-separated list of learning rates to test")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 32], help="Space-separated list of batch sizes to test")
+    parser.add_argument("--resume", action="store_true", help="If set, skip replicates already completed in the target tuning directory")
+    parser.add_argument("--tuning-dir", type=str, default=None, help="Path to an existing tuning directory to resume or append results into")
     args = parser.parse_args()
 
     print("--- End-to-End Tuning & Convergence ---")
@@ -387,13 +493,18 @@ def main():
             run_configs.append(config)
             
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     # Store in "Hyperparameter Tuning" directory instead of intertwining with datasets
     base_tuning_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Hyperparameter Tuning")
     models_str = "-".join(target_models)
-    dir_name = f"Tuning_{timestamp}_{args.dataset}_{models_str}"
-    tuning_dir = os.path.join(base_tuning_dir, dir_name)
-    os.makedirs(tuning_dir, exist_ok=True)
+    if args.tuning_dir:
+        tuning_dir = args.tuning_dir
+        os.makedirs(tuning_dir, exist_ok=True)
+    else:
+        dir_name = f"Tuning_{timestamp}_{args.dataset}_{models_str}"
+        tuning_dir = os.path.join(base_tuning_dir, dir_name)
+        os.makedirs(tuning_dir, exist_ok=True)
+
     transcript_path = os.path.join(tuning_dir, "terminal.log")
     transcript_handle = attach_transcript(transcript_path)
     print(f"[Run] Transcript: {transcript_path}")
@@ -426,6 +537,40 @@ def main():
     total_jobs = len(run_configs) * args.replicates
     completed_jobs = 0
 
+    def replicate_completed(run_dir, model_name, replicate_id):
+        """Return True if the replicate appears completed.
+
+        Checks (in order):
+        - entry exists in tuning_summary.csv for this model+replicate
+        - DONE marker file exists in the replicate dir
+
+        Note: we intentionally do NOT consider the presence of `best_model.pt` alone
+        as proof of completion because interrupted runs may have written partial
+        artifacts. Only a summary entry or explicit DONE marker indicate a
+        completed replicate.
+        """
+        summary_csv = os.path.join(run_dir, "tuning_summary.csv")
+        if os.path.exists(summary_csv):
+            try:
+                with open(summary_csv, "r", newline="") as sf:
+                    reader = csv.DictReader(sf)
+                    for row in reader:
+                        try:
+                            rep = int(row.get("replicate", -1))
+                        except Exception:
+                            rep = -1
+                        if row.get("model") == model_name and rep == replicate_id:
+                            return True
+            except Exception:
+                pass
+
+        model_dir = os.path.join(run_dir, model_name, f"Rep_{replicate_id}")
+        done_marker = os.path.join(model_dir, "DONE")
+        if os.path.exists(done_marker):
+            return True
+
+        return False
+
     print(f"[Run] Tuning directory: {tuning_dir}")
     print(f"[Run] Terminal transcript: {transcript_path}")
     print(f"[Run] Total jobs: {total_jobs} ({len(run_configs)} configs x {args.replicates} replicates)")
@@ -435,6 +580,21 @@ def main():
         print(f"\n{msg}")
         for rep in range(1, args.replicates + 1):
             completed_jobs += 1
+            # If resuming, check whether this replicate already completed (summary, DONE, or best model)
+            if args.resume and replicate_completed(tuning_dir, config["name"], rep):
+                print(f"[Run] Resume: skipping already-completed {config['name']} Rep {rep}")
+                continue
+
+            # If resuming and the replicate dir exists but is NOT marked complete,
+            # remove it entirely so we restart training deterministically from epoch 1.
+            model_dir_path = os.path.join(tuning_dir, config["name"], f"Rep_{rep}")
+            if args.resume and os.path.isdir(model_dir_path) and not replicate_completed(tuning_dir, config["name"], rep):
+                print(f"[Run] Resume: found incomplete artifacts for {config['name']} Rep {rep}, resetting folder: {model_dir_path}")
+                try:
+                    shutil.rmtree(model_dir_path)
+                except Exception as e:
+                    print(f"[Run] Warning: failed to remove {model_dir_path}: {e}")
+                os.makedirs(model_dir_path, exist_ok=True)
             job_msg = f"[Run] Job {completed_jobs}/{total_jobs} -> {config['name']} Rep {rep}/{args.replicates}"
             print(job_msg)
             end_to_end_tuning_worker(

@@ -65,13 +65,32 @@ DEFAULT_DRY_RUN = False
 DEFAULT_LOG_EVERY = 25
 DEFAULT_VERIFY_EACH_RESTART = True
 DEFAULT_PARAM_JITTER_STD = 0.01
+DEFAULT_BOUND_SIGMA = 2.0
 SUPPORTED_MODEL_FAMILIES = {"baseline", "hungarian", "sinkhorn"}
 
-# Parameter Constraints (Min, Max)
+# Fallback parameter constraints (Min, Max)
 # Corresponds to: [max_phytomers, plastochron, roll, down, branch, leaf_len, exp_wid, leaf_wid, bend, twist, node, int_wid, exp_rad]
-# These ranges should match the bounds used during data generation.
+# These are only used if a loaded surrogate does not expose normalization stats.
 PARAM_MIN = torch.tensor([8.0, 2.8, -110.0, -4.0, 125.0, 3.0, 0.48, 0.8, 80.0, 170.0, 0.6, 0.88, 0.48])
 PARAM_MAX = torch.tensor([12.0, 3.2, 110.0, 4.0, 145.0, 7.0, 0.52, 1.2, 100.0, 190.0, 0.8, 0.92, 0.52])
+
+def derive_parameter_bounds_from_model(model, sigma_multiplier=DEFAULT_BOUND_SIGMA):
+    """Derive optimizer bounds from the surrogate's own input normalization stats."""
+    input_mean = getattr(model, "input_mean", None)
+    input_std = getattr(model, "input_std", None)
+
+    if input_mean is None or input_std is None:
+        return PARAM_MIN.clone(), PARAM_MAX.clone(), False
+
+    input_mean = torch.as_tensor(input_mean, dtype=torch.float32).flatten()
+    input_std = torch.as_tensor(input_std, dtype=torch.float32).flatten().clamp_min(1e-6)
+
+    if input_mean.numel() != PARAM_MIN.numel() or input_std.numel() != PARAM_MIN.numel():
+        return PARAM_MIN.clone(), PARAM_MAX.clone(), False
+
+    param_min = input_mean - sigma_multiplier * input_std
+    param_max = input_mean + sigma_multiplier * input_std
+    return param_min, param_max, True
 
 class OptimizerNet(nn.Module):
     """
@@ -83,7 +102,7 @@ class OptimizerNet(nn.Module):
     the parameters (passed through a Sigmoid to enforce 0-1 range, then scaled) 
     keeps the optimization process stable and allows us to use standard NN optimizers.
     """
-    def __init__(self, input_dim=1, output_dim=13):
+    def __init__(self, input_dim=1, output_dim=13, param_min=None, param_max=None):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
@@ -94,8 +113,12 @@ class OptimizerNet(nn.Module):
             nn.Sigmoid()  # Force output to [0, 1]
         )
         # Register boundaries as buffers (not trainable parameters)
-        self.register_buffer('param_min', PARAM_MIN)
-        self.register_buffer('param_max', PARAM_MAX)
+        if param_min is None:
+            param_min = PARAM_MIN
+        if param_max is None:
+            param_max = PARAM_MAX
+        self.register_buffer('param_min', torch.as_tensor(param_min, dtype=torch.float32))
+        self.register_buffer('param_max', torch.as_tensor(param_max, dtype=torch.float32))
 
     def forward(self, x):
         # 1. Generate normalized parameters [0, 1]
@@ -432,10 +455,16 @@ def optimize_params_for_model(model, model_type, real_bp_batch, real_ep_batch, a
         f"Starting optimization for {model_type} "
         f"({args.restarts} restarts, {args.steps} steps, lr={args.lr})..."
     )
+
+    param_min, param_max, bounds_from_model = derive_parameter_bounds_from_model(model)
+    if bounds_from_model:
+        logging.info("  Parameter bounds derived from surrogate normalization stats (mean ± %.1f std).", DEFAULT_BOUND_SIGMA)
+    else:
+        logging.info("  Parameter bounds fallback to hard-coded ranges.")
     
     for restart in range(args.restarts):
         # Create fresh generator for each restart
-        opt_net = OptimizerNet().to(real_bp_batch.device) 
+        opt_net = OptimizerNet(param_min=param_min, param_max=param_max).to(real_bp_batch.device) 
         optimizer = optim.Adam(opt_net.parameters(), lr=args.lr)
         scheduler = optim.lr_scheduler.StepLR(
             optimizer,
@@ -455,8 +484,8 @@ def optimize_params_for_model(model, model_type, real_bp_batch, real_ep_batch, a
             # Small jitter helps avoid getting stuck on flat local regions.
             if args.param_jitter_std > 0:
                 pred_params = pred_params + torch.randn_like(pred_params) * args.param_jitter_std
-                pmin = PARAM_MIN.to(pred_params.device)
-                pmax = PARAM_MAX.to(pred_params.device)
+                pmin = opt_net.param_min.to(pred_params.device)
+                pmax = opt_net.param_max.to(pred_params.device)
                 pred_params = torch.max(torch.min(pred_params, pmax), pmin)
             
             # Predict Cost using Surrogate Model
