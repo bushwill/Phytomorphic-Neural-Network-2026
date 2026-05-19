@@ -22,7 +22,7 @@ def main():
     params = {
         "MAX_PHYTOMERS": 10.0,
         "PLASTOCHRON": 3.0,
-        "PlantRollAng": 45.0,  # Rotated 45 degrees to give a clear 3D/isometric perspective
+        "PlantRollAng": 40.0,  # Rotated 40 degrees to give a clear 3D/isometric perspective
         "PlantDownAng": 0.0,
         "BrAngle": 135.0,
         "LeafLen": 5.0,

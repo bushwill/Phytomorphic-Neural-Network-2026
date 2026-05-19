@@ -567,7 +567,9 @@ def main():
             config = base_config.copy()
             config["learning_rate"] = lr
             config["batch_size"] = bs
-            config["name"] = f"{input_name}_lr{lr}_bs{bs}"
+            # Include fraction and epoch config in name to avoid overwriting different convergence tests
+            frac_percent = int(args.dataset_fraction * 100)
+            config["name"] = f"{input_name}_lr{lr}_bs{bs}_frac{frac_percent}pct_ep{args.epochs}_pat{args.patience}"
             run_configs.append(config)
             
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

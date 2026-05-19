@@ -29,10 +29,6 @@ os.umask(0)
 # Ensure project modules are in path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-
-
-
-# --- USER CONFIGURATION ---
 # Dataset Generation Parameters
 PLANT_NAME = "Plant_063-32"   # Target real plant name
 TRAIN_SIZE = 10000            # Number of training samples
@@ -40,8 +36,6 @@ VAL_SIZE = 100                # Number of validation samples
 TEST_SIZE = 3000              # Number of test samples
 BASE_OUTPUT_DIR = "Datasets"  # Base directory for generated datasets
 SAMPLING_METHOD = "random"
-
-# --- END USER CONFIGURATION ---
 
 DEFAULT_PLANT = PLANT_NAME
 DEFAULT_TRAIN_SIZE = TRAIN_SIZE
@@ -79,7 +73,7 @@ def generate_random_samples(n_samples):
     """Generate samples using the exact Nazifa random parameter distribution."""
     samples = np.zeros((n_samples, len(PARAM_NAMES)))
     for i in range(n_samples):
-        # Match utils_nn.build_random_parameter_file exactly.
+        # Matches utils_nn.build_random_parameter_file
         chirality = -1.0 if uran(0.0, 1.0) < 0.5 else 1.0
 
         row = [
@@ -107,20 +101,20 @@ def _process_sample(args):
     uid = uuid.uuid4().hex[:8]
     worker_ws = None
     try:
-        # Give this process its own isolated copy of lsystem to avoid make collisions
+        # Create temporary file for LPFG execution to isolate parallel runs
         worker_ws = os.path.join(lsystem_tmp_root, f"worker_{uid}")
         os.makedirs(worker_ws, exist_ok=True)
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         lsystem_base = os.path.join(script_dir, "lsystem")
 
-        # Copy essential LPFG files into the isolated worker workspace
+        # Copy essential LPFG files into the temp file
         for item in os.listdir(lsystem_base):
             src = os.path.join(lsystem_base, item)
             if os.path.isfile(src) and not item.endswith('.o') and not item.endswith('.so'):
                 shutil.copy2(src, os.path.join(worker_ws, item))
 
-        # Compile project.cpp in the worker workspace if it doesn't have it
+        # Compile project.cpp in the worker workspace if it doesn't have it (necessary for LPFG)
         if not os.path.exists(os.path.join(worker_ws, "project")):
             ret = os.system(f"g++ -o {os.path.join(worker_ws, 'project')} -Wall -Wextra {os.path.join(worker_ws, 'project.cpp')} -lm")
             if ret != 0:
@@ -131,13 +125,14 @@ def _process_sample(args):
         os.makedirs(temp_out_dir, exist_ok=True)
 
         # 1. Generate L-System Structure
+        # Generate parameter file
         build_parameter_file(temp_param_file, params)
         
-        # Build lpfg command components (Using absolute paths inside the worker workspace)
+        # Build lpfg command components
         abs_output_dir = os.path.abspath(temp_out_dir)
         abs_param_file = os.path.abspath(temp_param_file)
         
-        # Function to get lsystem file paths from worker workspace
+        # Function to get lsystem file paths from temp file
         def ls(f): return os.path.join(worker_ws, f)
 
         # Build lpfg command components 

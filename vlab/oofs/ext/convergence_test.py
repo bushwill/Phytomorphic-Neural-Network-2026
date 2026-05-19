@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Convergence Analysis - Post-Processing & Reporting
 
