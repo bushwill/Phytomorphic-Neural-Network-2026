@@ -3,7 +3,11 @@ vlab/oofs/ext/Real Plants/
 vlab/oofs/ext/Optimizer Data
 vlab/oofs/ext/Training Data
 vlab/oofs/ext/l-system images
+vlab/oofs/ext/lsystem/tmp
+vlab/oofs/ext/lsystem/verify_tmp
 vlab/oofs/ext/Hyperparameter Tuning
 vlab/oofs/ext/Convergence Tests
+vlab/oofs/ext/Final HP Tune
+vlab/oofs/ext/Ablation Tests
 vlab/oofs/ext/Research Pipeline
 vlab/oofs/ext/__pycache__

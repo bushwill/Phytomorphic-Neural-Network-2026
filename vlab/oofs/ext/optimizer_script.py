@@ -82,7 +82,13 @@ DEFAULT_LOG_EVERY = 25
 DEFAULT_VERIFY_EACH_RESTART = True
 DEFAULT_PARAM_JITTER_STD = 0.01
 DEFAULT_BOUND_SIGMA = 2.0
-SUPPORTED_MODEL_FAMILIES = {"baseline", "hungarian", "sinkhorn"}
+SINKHORN_ABLATION_FAMILIES = {
+    "sinkhorn_no_encoder",
+    "sinkhorn_no_scaler",
+    "sinkhorn_no_aggregator",
+    "sinkhorn_hollow",
+}
+SUPPORTED_MODEL_FAMILIES = {"baseline", "hungarian", "sinkhorn", *SINKHORN_ABLATION_FAMILIES}
 
 # Fallback parameter constraints (Min, Max)
 # Corresponds to: [max_phytomers, plastochron, roll, down, branch, leaf_len, exp_wid, leaf_wid, bend, twist, node, int_wid, exp_rad]
@@ -193,15 +199,29 @@ def extract_model_family(model_path):
       - <run>/<family>/Rep_n/best_model.pt
       - <run>/<family>/best_model.pt
     """
-    model_dir = os.path.dirname(os.path.abspath(model_path))
-    parent = os.path.basename(model_dir).lower()
+    path_parts = [part.lower() for part in Path(model_path).parts]
+    for part in reversed(path_parts):
+        if part in SUPPORTED_MODEL_FAMILIES:
+                        return part
+    return os.path.basename(os.path.dirname(os.path.abspath(model_path))).lower()
 
-    if parent.startswith("rep_"):
-        family = os.path.basename(os.path.dirname(model_dir)).lower()
-    else:
-        family = parent
-
+def normalize_model_family(family):
+    """Map supported model folders to the surrogate implementation they use."""
+    if family in {"sinkhorn", *SINKHORN_ABLATION_FAMILIES}:
+        return "sinkhorn"
     return family
+
+def get_sinkhorn_model_kwargs(family):
+    """Reconstruct the Sinkhorn architecture flags used when training a checkpoint."""
+    if family == "sinkhorn_no_encoder":
+        return {"use_encoder": False, "use_scaler": True, "use_aggregator": True}
+    if family == "sinkhorn_no_scaler":
+        return {"use_encoder": True, "use_scaler": False, "use_aggregator": True}
+    if family == "sinkhorn_no_aggregator":
+        return {"use_encoder": True, "use_scaler": True, "use_aggregator": False}
+    if family == "sinkhorn_hollow":
+        return {"use_encoder": False, "use_scaler": False, "use_aggregator": False}
+    return {"use_encoder": True, "use_scaler": True, "use_aggregator": True}
 
 def load_model(model_path):
     """
@@ -209,17 +229,19 @@ def load_model(model_path):
     Returns (model_instance, model_type_string).
     """
     path_str = str(model_path)
-    family = extract_model_family(path_str)
+    variant = extract_model_family(path_str)
+    model_family = normalize_model_family(variant)
+    model_kwargs = get_sinkhorn_model_kwargs(variant) if model_family == "sinkhorn" else {}
 
-    if family == "sinkhorn":
+    if model_family == "sinkhorn":
         logging.info(f"Loading {path_str} (Type: Sinkhorn Hierarchical)")
         ModelClass = sinkhorn_model.HierarchicalPlantSurrogateNet
         model_type = "sinkhorn"
-    elif family == "baseline":
+    elif model_family == "baseline":
         logging.info(f"Loading {path_str} (Type: Baseline MLP)")
         ModelClass = benchmark_model.BenchmarkSurrogateNet
         model_type = "mlp"
-    elif family == "hungarian":
+    elif model_family == "hungarian":
         logging.info(f"Loading {path_str} (Type: Hungarian Hierarchical)")
         ModelClass = baseline_model.HierarchicalPlantSurrogateNet
         model_type = "hungarian"
@@ -230,7 +252,7 @@ def load_model(model_path):
         )
         return None, None
 
-    model = ModelClass()
+    model = ModelClass(**model_kwargs)
     try:
         # Load weights (map to CPU for safety)
         state_dict = torch.load(model_path, map_location='cpu')
@@ -378,10 +400,86 @@ def cleanup_empty_verify_dirs(model_output_dir):
         if not os.listdir(current_dir):
             os.rmdir(current_dir)
 
-def build_optimizer_summaries(run_output_dir):
-    """Collect per-model optimization results into root-level summary CSV files."""
-    result_rows = []
+def _safe_float(value):
+    try:
+        if value in (None, ""):
+            return float("nan")
+        return float(value)
+    except Exception:
+        return float("nan")
 
+
+def _extract_optimizer_record(result_path):
+    try:
+        with open(result_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            record = next(reader, None)
+    except Exception as e:
+        logging.warning(f"Skipping optimizer result read for {result_path}: {e}")
+        return None
+
+    if not record:
+        return None
+
+    row = {
+        "best_pred_lpfg_cost": _safe_float(record.get("surrogate_pred_cost", "nan")),
+        "best_lpfg_cost_optimized_true": _safe_float(record.get("verified_sim_cost", "nan")),
+    }
+
+    for idx, name in enumerate(LSYSTEM_PARAM_NAMES):
+        named_key = f"opt_{name}"
+        legacy_key = f"param_{idx}"
+        row[f"best_{name}"] = _safe_float(record.get(named_key, record.get(legacy_key, "nan")))
+
+    row["optimized_true"] = bool(np.isfinite(row["best_lpfg_cost_optimized_true"]))
+    return row
+
+
+def _load_tuning_r2_map(run_dir):
+    """Scan run_dir for tuning_summary.csv files and return mapping:
+    { model_name: { replicate_str: best_val_r2_float } }
+    """
+    mapping = {}
+    if not run_dir:
+        return mapping
+    for root, _, files in os.walk(run_dir):
+        if "tuning_summary.csv" not in files:
+            continue
+        path = os.path.join(root, "tuning_summary.csv")
+        try:
+            with open(path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    model = row.get("model", "")
+                    replicate = str(row.get("replicate", ""))
+                    try:
+                        val = float(row.get("best_val_r2", "nan"))
+                    except Exception:
+                        val = float("nan")
+                    if model:
+                        mapping.setdefault(model, {})[replicate] = val
+        except Exception:
+            logging.warning(f"Failed to read tuning_summary.csv at {path}")
+    return mapping
+
+
+def build_optimizer_summaries(run_output_dir, run_dir=None):
+    """Collect optimizer results into run-level and model-level summary CSV files."""
+    summary_csv_path = os.path.join(run_output_dir, "summary.csv")
+    if os.path.exists(summary_csv_path):
+        try:
+            os.remove(summary_csv_path)
+        except OSError as e:
+            logging.warning(f"Could not remove stale summary.csv at {summary_csv_path}: {e}")
+
+    summary_results_path = os.path.join(run_output_dir, "summary_results.csv")
+    summary_by_model_path = os.path.join(run_output_dir, "summary_by_model.csv")
+    best_lpfg_report_path = os.path.join(run_output_dir, "best_lpfg_report.csv")
+
+    # Load training tuning R2 values if provided
+    tuning_r2_map = _load_tuning_r2_map(run_dir) if run_dir else {}
+
+    rows = []
     for root, _, files in os.walk(run_output_dir):
         if "opt_result.csv" not in files:
             continue
@@ -389,80 +487,133 @@ def build_optimizer_summaries(run_output_dir):
         result_path = os.path.join(root, "opt_result.csv")
         rel_path = os.path.relpath(root, run_output_dir)
         parts = rel_path.split(os.sep)
-        model_family = parts[0] if parts else os.path.basename(root)
-        run_variant = os.path.join(*parts[1:]) if len(parts) > 1 else ""
+        model_name = parts[-2] if len(parts) >= 2 else os.path.basename(root)
+        replicate = parts[-1].replace("Rep_", "") if parts else ""
+        plant_name = parts[0] if len(parts) >= 5 else ""
+        dataset_name = parts[1] if len(parts) >= 5 else ""
+        optimizer_run = parts[2] if len(parts) >= 5 else ""
 
-        try:
-            with open(result_path, "r", newline="") as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                values = next(reader, None)
+        record = _extract_optimizer_record(result_path)
+        if record is None:
+            continue
 
-            if not header or not values:
-                continue
+        row = {
+            "model_name": model_name,
+            "replicate": replicate,
+            "plant_name": plant_name,
+            "dataset_name": dataset_name,
+            "optimizer_run": optimizer_run,
+            "relative_path": rel_path,
+            "selection_basis": "optimized_true" if record["optimized_true"] else "predicted",
+        }
+        # Attach any available tuning R2
+        r2_val = tuning_r2_map.get(model_name, {}).get(str(replicate), None)
+        row["best_val_r2"] = r2_val if r2_val is not None else float("nan")
+        row.update(record)
+        rows.append(row)
 
-            record = dict(zip(header, values))
-            row = {
-                "model_family": model_family,
-                "run_variant": run_variant,
-                "relative_path": rel_path,
-                "surrogate_pred_cost": float(record.get("surrogate_pred_cost", "nan")),
-                "verified_sim_cost": float(record.get("verified_sim_cost", "nan")),
-            }
-
-            for idx, name in enumerate(LSYSTEM_PARAM_NAMES):
-                named_key = f"opt_{name}"
-                legacy_key = f"param_{idx}"
-                if named_key in record and record[named_key] != "":
-                    row[named_key] = float(record[named_key])
-                    row[legacy_key] = float(record[named_key])
-                elif legacy_key in record and record[legacy_key] != "":
-                    row[legacy_key] = float(record[legacy_key])
-                    row[named_key] = float(record[legacy_key])
-
-            result_rows.append(row)
-        except Exception as e:
-            logging.warning(f"Skipping summary read for {result_path}: {e}")
-
-    if not result_rows:
+    if not rows:
         logging.warning("No optimizer result files found for summary generation.")
         return
 
-    result_rows.sort(key=lambda item: (item["model_family"], item["run_variant"], item["relative_path"]))
+    rows.sort(key=lambda item: (item.get("model_name", ""), item.get("replicate", "")))
 
-    param_keys = [f"opt_{name}" for name in LSYSTEM_PARAM_NAMES]
-    summary_path = os.path.join(run_output_dir, "summary_results.csv")
-    fieldnames = ["model_family", "run_variant", "relative_path", "surrogate_pred_cost", "verified_sim_cost"] + param_keys
+    detail_fieldnames = [
+        "model_name",
+        "replicate",
+        "plant_name",
+        "dataset_name",
+        "optimizer_run",
+        "relative_path",
+        "selection_basis",
+        "best_pred_lpfg_cost",
+        "best_lpfg_cost_optimized_true",
+        "best_val_r2",
+        "optimized_true",
+    ] + [f"best_{name}" for name in LSYSTEM_PARAM_NAMES]
 
-    with open(summary_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(summary_results_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=detail_fieldnames)
         writer.writeheader()
-        for row in result_rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in detail_fieldnames})
 
     grouped = {}
-    for row in result_rows:
-        grouped.setdefault(row["model_family"], []).append(row)
+    for row in rows:
+        grouped.setdefault(row.get("model_name", "unknown"), []).append(row)
 
-    summary_by_model_path = os.path.join(run_output_dir, "summary_by_model.csv")
-    agg_fieldnames = ["model_family", "n_runs", "surrogate_pred_cost_mean", "surrogate_pred_cost_std", "verified_sim_cost_mean", "verified_sim_cost_std"]
+    def rank_row(row):
+        verified_cost = row.get("best_lpfg_cost_optimized_true", float("nan"))
+        pred_cost = row.get("best_pred_lpfg_cost", float("nan"))
+        if np.isfinite(verified_cost):
+            return (0, verified_cost, pred_cost)
+        return (1, pred_cost, verified_cost)
+
+    summary_model_fieldnames = [
+        "model_name",
+        "n_runs",
+        "n_verified",
+        "best_replicate",
+        "selection_basis",
+        "best_pred_lpfg_cost",
+        "best_lpfg_cost_optimized_true",
+        "best_val_r2",
+        "optimized_true",
+    ] + [f"best_{name}" for name in LSYSTEM_PARAM_NAMES]
+
     with open(summary_by_model_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=agg_fieldnames)
+        writer = csv.DictWriter(f, fieldnames=summary_model_fieldnames)
         writer.writeheader()
-        for model_family, rows in sorted(grouped.items()):
-            surrogate_vals = np.array([row["surrogate_pred_cost"] for row in rows], dtype=float)
-            verified_vals = np.array([row["verified_sim_cost"] for row in rows], dtype=float)
+        for model_name, model_rows in sorted(grouped.items()):
+            best_row = min(model_rows, key=rank_row)
             writer.writerow({
-                "model_family": model_family,
-                "n_runs": len(rows),
-                "surrogate_pred_cost_mean": float(np.mean(surrogate_vals)),
-                "surrogate_pred_cost_std": float(np.std(surrogate_vals)),
-                "verified_sim_cost_mean": float(np.mean(verified_vals)),
-                "verified_sim_cost_std": float(np.std(verified_vals)),
+                "model_name": model_name,
+                "n_runs": len(model_rows),
+                "n_verified": sum(1 for row in model_rows if np.isfinite(row.get("best_lpfg_cost_optimized_true", float("nan")))),
+                "best_replicate": best_row.get("replicate", ""),
+                "selection_basis": best_row.get("selection_basis", ""),
+                "best_pred_lpfg_cost": best_row.get("best_pred_lpfg_cost", ""),
+                "best_lpfg_cost_optimized_true": best_row.get("best_lpfg_cost_optimized_true", ""),
+                "best_val_r2": best_row.get("best_val_r2", ""),
+                "optimized_true": best_row.get("optimized_true", ""),
+                **{f"best_{name}": best_row.get(f"best_{name}", "") for name in LSYSTEM_PARAM_NAMES},
             })
 
-    logging.info(f"Summary saved to {summary_path}")
+    ranked_rows = sorted(rows, key=rank_row)
+    best_report_fields = [
+        "rank",
+        "plant_name",
+        "dataset_name",
+        "model_name",
+        "replicate",
+        "selection_basis",
+        "best_lpfg_cost_optimized_true",
+        "best_pred_lpfg_cost",
+        "best_val_r2",
+        "optimized_true",
+        "relative_path",
+    ]
+    with open(best_lpfg_report_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=best_report_fields)
+        writer.writeheader()
+        for idx, row in enumerate(ranked_rows, start=1):
+            writer.writerow({
+                "rank": idx,
+                "plant_name": row.get("plant_name", ""),
+                "dataset_name": row.get("dataset_name", ""),
+                "model_name": row.get("model_name", ""),
+                "replicate": row.get("replicate", ""),
+                "selection_basis": row.get("selection_basis", ""),
+                "best_lpfg_cost_optimized_true": row.get("best_lpfg_cost_optimized_true", ""),
+                "best_pred_lpfg_cost": row.get("best_pred_lpfg_cost", ""),
+                "best_val_r2": row.get("best_val_r2", ""),
+                "optimized_true": row.get("optimized_true", ""),
+                "relative_path": row.get("relative_path", ""),
+            })
+
+    logging.info(f"Summary saved to {summary_results_path}")
     logging.info(f"Model summary saved to {summary_by_model_path}")
+    logging.info(f"Best LPFG report saved to {best_lpfg_report_path}")
 
 def optimize_params_for_model(model, model_type, real_bp_batch, real_ep_batch, args):
     """
@@ -650,6 +801,11 @@ def main():
         default=DEFAULT_PARAM_JITTER_STD,
         help="Small Gaussian jitter added to parameters during optimization",
     )
+    parser.add_argument(
+        "--summary_only",
+        action="store_true",
+        help="Only aggregate existing optimization outputs into summary CSVs",
+    )
     args = parser.parse_args()
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -662,6 +818,22 @@ def main():
     # are always written to the intended project folders.
     if not os.path.isabs(args.output_dir):
         args.output_dir = os.path.join(script_dir, args.output_dir)
+
+    if args.summary_only:
+        os.makedirs(args.output_dir, exist_ok=True)
+        run_output_dir = args.output_dir
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[
+                logging.FileHandler(os.path.join(run_output_dir, "optimizer_log.txt")),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        logging.info(f"Summary Output Directory: {run_output_dir}")
+        logging.info(f"Optimizer Results Directory: {args.run_dir}")
+        build_optimizer_summaries(run_output_dir, args.run_dir)
+        return
     
     # Create a run-scoped output folder to match the rest of the project.
     run_output_dir, run_name = create_run_output_dir(args.output_dir)
@@ -682,27 +854,47 @@ def main():
     real_bp_batch, real_ep_batch = utils_nn.prepare_real_plant_batch(real_bp, real_ep)
     
     # 3. Find Models to Optimize
+    # If explicit model files are provided via --model, treat that list as
+    # authoritative and skip run_dir auto-discovery.
     models_to_process = []
-    if args.run_dir and os.path.exists(args.run_dir):
+    if args.model:
+        for m in args.model:
+            if os.path.exists(m):
+                models_to_process.append(m)
+            else:
+                logging.warning(f"Explicit model path not found (skipping): {m}")
+    elif args.run_dir and os.path.exists(args.run_dir):
         selected_families = {m.strip().lower() for m in args.models}
         unknown_requested = sorted(selected_families - SUPPORTED_MODEL_FAMILIES)
         if unknown_requested:
             logging.warning(f"Ignoring unsupported model filters: {unknown_requested}")
         selected_families = selected_families & SUPPORTED_MODEL_FAMILIES
+        if "sinkhorn" in selected_families:
+            selected_families |= SINKHORN_ABLATION_FAMILIES
 
         for root, _, files in os.walk(args.run_dir):
-            if "best_model.pt" in files:
+            if "final_model.pt" in files:
+                model_path = os.path.join(root, "final_model.pt")
+            elif "best_model.pt" in files:
                 model_path = os.path.join(root, "best_model.pt")
+            else:
+                continue
+
+            rel_path = os.path.relpath(model_path, args.run_dir)
+            rel_parts = [part.lower() for part in Path(rel_path).parts]
+            model_family = None
+            for part in rel_parts:
+                if part in SUPPORTED_MODEL_FAMILIES:
+                    model_family = normalize_model_family(part)
+                    break
+
+            if model_family is None:
                 model_family = extract_model_family(model_path)
-                if model_family in selected_families:
-                    models_to_process.append(model_path)
+
+            if model_family in selected_families:
+                models_to_process.append(model_path)
     else:
         logging.warning(f"Model search directory not found: {args.run_dir}")
-                
-    if args.model:
-        for m in args.model:
-            if os.path.exists(m):
-                models_to_process.append(m)
                 
     models_to_process = list(set(models_to_process))
     
@@ -757,6 +949,38 @@ def main():
                     f"  Selected by real cost from restarts: "
                     f"restart={best_by_real[0]} | surrogate={best_by_real[1]:.4f} | actual={best_by_real[2]:.4f}"
                 )
+
+        if restart_records:
+            restart_rows = {rec["restart"]: {
+                "restart": rec["restart"],
+                "surrogate_pred_cost": rec["surrogate_cost"],
+                "verified_sim_cost": float("nan"),
+                "params": rec["params"],
+            } for rec in restart_records}
+
+            for idx, surrogate_cost_res, real_cost, params in verified_restart_rows:
+                restart_rows[idx] = {
+                    "restart": idx,
+                    "surrogate_pred_cost": surrogate_cost_res,
+                    "verified_sim_cost": real_cost,
+                    "params": params,
+                }
+
+            restart_results_path = os.path.join(model_output_dir, "restart_results.csv")
+            with open(restart_results_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                header = ["restart", "surrogate_pred_cost", "verified_sim_cost"] + [f"opt_{name}" for name in LSYSTEM_PARAM_NAMES]
+                writer.writerow(header)
+                for restart_idx in sorted(restart_rows):
+                    row = restart_rows[restart_idx]
+                    param_values = row["params"].detach().cpu().view(-1).tolist()
+                    writer.writerow([
+                        row["restart"],
+                        row["surrogate_pred_cost"],
+                        row["verified_sim_cost"],
+                        *param_values,
+                    ])
+            logging.info(f"Restart results saved to {restart_results_path}")
         
         # B. Verify Result (via Simulation)
         real_cost = float('nan')
@@ -788,7 +1012,7 @@ def main():
 
             cleanup_empty_verify_dirs(model_output_dir)
 
-    build_optimizer_summaries(run_output_dir)
+    build_optimizer_summaries(run_output_dir, args.run_dir)
 
 
 if __name__ == "__main__":

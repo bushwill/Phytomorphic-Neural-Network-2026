@@ -199,6 +199,28 @@ def _process_sample(args):
         if worker_ws and os.path.exists(worker_ws):
             shutil.rmtree(worker_ws, ignore_errors=True)
 
+def cleanup_worker_dirs(lsystem_tmp_root):
+    """Remove leftover worker directories under an lsystem tmp split folder."""
+    removed = 0
+    failed = 0
+    if not os.path.isdir(lsystem_tmp_root):
+        return removed, failed
+
+    for name in os.listdir(lsystem_tmp_root):
+        if not name.startswith("worker_"):
+            continue
+        worker_path = os.path.join(lsystem_tmp_root, name)
+        if not os.path.isdir(worker_path):
+            continue
+        try:
+            shutil.rmtree(worker_path)
+            removed += 1
+        except Exception as e:
+            failed += 1
+            logging.warning(f"  Failed to remove stale worker directory {worker_path}: {e}")
+
+    return removed, failed
+
 def generate_split(split_name, size, real_data, output_dir):
     """Generates a dataset split (Train/Val/Test)."""
     if size <= 0:
@@ -228,20 +250,31 @@ def generate_split(split_name, size, real_data, output_dir):
     lsystem_tmp_root = os.path.join(script_dir, "lsystem", "tmp", split_name)
     os.makedirs(lsystem_tmp_root, exist_ok=True)
 
+    # Remove leftovers from interrupted runs before launching new workers.
+    removed, failed = cleanup_worker_dirs(lsystem_tmp_root)
+    if removed > 0 or failed > 0:
+        logging.info(f"  Pre-run worker cleanup in {lsystem_tmp_root}: removed={removed}, failed={failed}")
+
     args_list = [(i, params_array[i], split_name, real_bp, real_ep, structures_dir, lsystem_tmp_root) for i in range(size)]
 
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        for i, success, result in executor.map(_process_sample, args_list):
-            if success:
-                # Save CSV Row serially to avoid exact parallel append conflicts
-                with open(csv_path, "a", newline="") as f:
-                    csv.writer(f).writerow(result)
-                valid_count += 1
-            else:
-                logging.warning(f"  Sample {i} failed: {result}")
-            
-            if (i + 1) % 50 == 0:
-                logging.info(f"  Processed {i+1}/{size} samples.")
+    try:
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            for i, success, result in executor.map(_process_sample, args_list):
+                if success:
+                    # Save CSV Row serially to avoid exact parallel append conflicts
+                    with open(csv_path, "a", newline="") as f:
+                        csv.writer(f).writerow(result)
+                    valid_count += 1
+                else:
+                    logging.warning(f"  Sample {i} failed: {result}")
+                
+                if (i + 1) % 50 == 0:
+                    logging.info(f"  Processed {i+1}/{size} samples.")
+    finally:
+        # Best-effort cleanup for any crash/interruption leftovers.
+        removed, failed = cleanup_worker_dirs(lsystem_tmp_root)
+        if removed > 0 or failed > 0:
+            logging.info(f"  Post-run worker cleanup in {lsystem_tmp_root}: removed={removed}, failed={failed}")
 
     logging.info(f"Finished {split_name}. Valid: {valid_count}/{size}. Time: {time.time() - start_time:.2f}s")
     return valid_count

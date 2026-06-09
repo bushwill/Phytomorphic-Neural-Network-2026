@@ -146,6 +146,14 @@ MODEL_BASE_CONFIGS = {
         "internal_type": "sinkhorn",
         "model_kwargs": {"use_encoder": True, "use_scaler": True, "use_aggregator": False}
     },
+    "sinkhorn_hollow": {
+        "dataset_class": model_base.PlantDataset,
+        "model_class": sinkhorn_model.HierarchicalPlantSurrogateNet,
+        "loss_fn": model_base.hierarchical_loss_function,
+        "module": sinkhorn_model,
+        "internal_type": "sinkhorn",
+        "model_kwargs": {"use_encoder": False, "use_scaler": False, "use_aggregator": False}
+    },
     "mlp": {
         "dataset_class": benchmark_mlp.PlantDataset,
         "model_class": benchmark_mlp.BenchmarkSurrogateNet,
@@ -307,6 +315,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     log_csv = os.path.join(model_dir, "tuning_log.csv")
     best_model_path = os.path.join(model_dir, "best_model.pt")
     best_val_model_path = os.path.join(model_dir, "best_val_model.pt")
+    final_model_path = os.path.join(model_dir, "final_model.pt")
     log_status(f"[Worker] Active output dir: {model_dir}")
     
     # Initialize Model
@@ -327,9 +336,9 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     with open(log_csv, "w") as f:
         f.write("epoch,train_loss,val_mse,val_r2,opt_surrogate_cost,opt_real_lpfg_cost,time_sec\n")
         
-    best_lpfg_cost = float('inf')
+    best_lpfg_cost = float('nan') if args.train_only else float('inf')
     best_lpfg_params = None
-    best_lpfg_surrogate_cost = float('inf')
+    best_lpfg_surrogate_cost = float('nan') if args.train_only else float('inf')
     best_val_r2 = -float('inf')
     patience_counter = 0
     total_epochs_trained = 0
@@ -349,25 +358,34 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
         # 2. Standard Validation
         val_metrics = validate(model, val_loader, data["real_bp_batch"], data["real_ep_batch"])
         
-        # 3. Lightweight End-to-End Evaluation
-        model.eval()
-        model.to('cpu')
-        
-        best_params, opt_cost, _ = optimize_params_for_model(
-            model, model_opt_type, data["real_bp_batch"].to('cpu'), data["real_ep_batch"].to('cpu'), opt_args
-        )
-        
-        # Verify physically with LPFG
-        syn_bp, syn_ep = run_simulation_verification(best_params, output_dir=verify_dir)
-        
-        real_lpfg_cost = float('inf')
-        if syn_bp is not None:
-            real_lpfg_cost = evaluate_real_cost(syn_bp, syn_ep, data["real_bp"], data["real_ep"])
-        
+        if not args.train_only:
+            # 3. Lightweight End-to-End Evaluation
+            model.eval()
+            model.to('cpu')
+
+            best_params, opt_cost, _ = optimize_params_for_model(
+                model, model_opt_type, data["real_bp_batch"].to('cpu'), data["real_ep_batch"].to('cpu'), opt_args
+            )
+
+            # Verify physically with LPFG
+            syn_bp, syn_ep = run_simulation_verification(best_params, output_dir=verify_dir)
+
+            real_lpfg_cost = float('inf')
+            if syn_bp is not None:
+                real_lpfg_cost = evaluate_real_cost(syn_bp, syn_ep, data["real_bp"], data["real_ep"])
+        else:
+            best_params = None
+            opt_cost = float('nan')
+            real_lpfg_cost = float('nan')
+
         elapsed = time.time() - ep_start
-        print(f"[{unique_run_name}] Ep {epoch+1}/{args.epochs} | "
-              f"Val R2: {val_metrics['r2']:.4f} (Best: {max(best_val_r2, val_metrics['r2']):.4f}) | "
-              f"LPFG Cost: {real_lpfg_cost:.4f} (Best: {min(best_lpfg_cost, real_lpfg_cost):.4f})")
+        if args.train_only:
+            print(f"[{unique_run_name}] Ep {epoch+1}/{args.epochs} | "
+                  f"Val R2: {val_metrics['r2']:.4f} (Best: {max(best_val_r2, val_metrics['r2']):.4f})")
+        else:
+            print(f"[{unique_run_name}] Ep {epoch+1}/{args.epochs} | "
+                  f"Val R2: {val_metrics['r2']:.4f} (Best: {max(best_val_r2, val_metrics['r2']):.4f}) | "
+                  f"LPFG Cost: {real_lpfg_cost:.4f} (Best: {min(best_lpfg_cost, real_lpfg_cost):.4f})")
         
         with open(log_csv, "a") as f:
             f.write(f"{epoch+1},{train_loss:.6f},{val_metrics['loss']:.6f},{val_metrics['r2']:.6f},"
@@ -383,14 +401,14 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             except Exception:
                 pass
 
-        if real_lpfg_cost < best_lpfg_cost:
+        if not args.train_only and real_lpfg_cost < best_lpfg_cost:
             best_lpfg_cost = real_lpfg_cost
             best_lpfg_params = best_params.detach().cpu().view(-1).clone()
             best_lpfg_surrogate_cost = float(opt_cost)
             patience_counter = 0
             torch.save(model.state_dict(), best_model_path)
             print(f"[{unique_run_name}] * New best LPFG score achieved! Saving model.")
-        else:
+        elif not args.train_only:
             patience_counter += 1
             print(f"[{unique_run_name}] LPFG score did not improve. Patience: {patience_counter}/{args.patience}")
             if patience_counter >= args.patience:
@@ -399,14 +417,20 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
                 
         ep_start = time.time()
         
+    torch.save(model.state_dict(), final_model_path)
+    print(f"[{unique_run_name}] Saved final model -> {final_model_path}")
+
     cleanup_empty_verify_dirs(model_dir)
     log_status(f"[Worker] Finished {unique_run_name}. Best LPFG Score: {best_lpfg_cost:.4f} | Best R2: {best_val_r2:.4f}")
     transcript_handle.flush()
 
     # Final test-set R2 report with the exact vectors used in the calculation.
-    # Prefer the model that achieved the best validation R2 for reporting consistency
+    # Prefer the final model for post-training evaluation so the reported score
+    # matches the fully trained checkpoint, not an earlier best checkpoint.
     model_to_load = None
-    if os.path.exists(best_val_model_path):
+    if os.path.exists(final_model_path):
+        model_to_load = final_model_path
+    elif os.path.exists(best_val_model_path):
         model_to_load = best_val_model_path
     elif os.path.exists(best_model_path):
         model_to_load = best_model_path
@@ -444,7 +468,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             target_value = float(test_loader_report["targets"][idx])
             rf.write(f"{pred_value:.10f},{target_value:.10f},{(target_value - pred_value):.10f}\n")
 
-    if best_lpfg_params is not None:
+    if best_lpfg_params is not None and not args.train_only:
         optimized_params_path = os.path.join(model_dir, "optimized_params.csv")
         with open(optimized_params_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -478,6 +502,9 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     summary_csv = os.path.join(run_dir, "tuning_summary.csv")
     write_header = not os.path.exists(summary_csv)
     
+    summary_lpfg_cost = "" if args.train_only else f"{best_lpfg_cost:.6f}"
+    summary_lpfg_surrogate_cost = "" if args.train_only else f"{best_lpfg_surrogate_cost:.6f}"
+
     with open(summary_csv, "a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
@@ -501,8 +528,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             args.dataset_fraction,
             total_epochs_trained,
             f"{best_val_r2:.6f}",
-            f"{best_lpfg_cost:.6f}",
-            f"{best_lpfg_surrogate_cost:.6f}",
+            summary_lpfg_cost,
+            summary_lpfg_surrogate_cost,
             *[f"{value:.10f}" for value in _params_to_list(best_lpfg_params)],
         ])
     print(f"[{unique_run_name}] Updated tuning summary -> {summary_csv}")
@@ -529,6 +556,7 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 32], help="Space-separated list of batch sizes to test")
     parser.add_argument("--resume", action="store_true", help="If set, skip replicates already completed in the target tuning directory")
     parser.add_argument("--tuning-dir", type=str, default=None, help="Path to an existing tuning directory to resume or append results into")
+    parser.add_argument("--train-only", action="store_true", help="Skip per-epoch optimization and only train the surrogate models")
     args = parser.parse_args()
 
     print("--- End-to-End Tuning & Convergence ---")

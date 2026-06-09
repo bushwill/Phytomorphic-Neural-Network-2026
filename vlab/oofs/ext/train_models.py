@@ -43,8 +43,8 @@ from utils_nn import read_real_plants, prepare_real_plant_batch, configure_outpu
 # --- USER CONFIGURATION ---
 DATASET_NAME = "Run 031326"  # Source folder in Datasets/
 PLANT_NAME = "Plant_063-32"  # Real plant reference for structure comparison
-NUM_REPLICATES = 3           # Independent runs per model type
-NUM_EPOCHS = 10              # Training duration
+NUM_REPLICATES = 2           # Independent runs per model type
+NUM_EPOCHS = 20              # Training duration
 BATCH_SIZE = 32              # Batch size (Tuned)
 LEARNING_RATE = 5e-4         # Learning Rate (Tuned)
 USE_MULTIPROCESSING = True   # Parallel training
@@ -140,12 +140,24 @@ def parse_arguments():
                         help="Optional output run name override for Training Data")
     parser.add_argument("--replicates", type=int, default=NUM_REPLICATES, 
                         help=f"Replicates per model (default: {NUM_REPLICATES})")
+    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS,
+                        help=f"Training epochs per replicate (default: {NUM_EPOCHS})")
     parser.add_argument("--models", type=str, nargs="+", default=None,
                         help="List of model names to train (e.g., baseline sinkhorn). If not provided, trains all models in registry.")
     parser.add_argument("--no-multiprocessing", action="store_true", default=not USE_MULTIPROCESSING, 
                         help="Disable multiprocessing")
     parser.add_argument("--skip-evaluation", action="store_true",
                         help="Skip automatic post-training evaluation step")
+    parser.add_argument("--train-only", action="store_true",
+                        help="Train full epochs and skip any optimization-specific reporting")
+    parser.add_argument("--mlp-learning-rate", type=float, default=None,
+                        help="Override learning rate for baseline (MLP) model")
+    parser.add_argument("--mlp-batch-size", type=int, default=None,
+                        help="Override batch size for baseline (MLP) model")
+    parser.add_argument("--sinkhorn-learning-rate", type=float, default=None,
+                        help="Override learning rate for sinkhorn model(s)")
+    parser.add_argument("--sinkhorn-batch-size", type=int, default=None,
+                        help="Override batch size for sinkhorn model(s)")
     return parser.parse_known_args()[0]
 
 # --- UTILS ---
@@ -445,8 +457,12 @@ def train_model_worker(config, run_dir, input_mean, input_std, output_mean, outp
     total_duration = model_end_time - model_start_time
     print(f"[Worker] Finished {unique_run_name}. Best Val Loss: {best_val_loss:.4f}")
     
-    # Final evaluation on the best checkpoint.
-    model.load_state_dict(torch.load(best_model_path))
+    final_model_path = os.path.join(model_dir, "final_model.pt")
+    torch.save(model.state_dict(), final_model_path)
+    print(f"[Worker] Saved final model -> {final_model_path}")
+
+    # Final evaluation on the final checkpoint.
+    model.load_state_dict(torch.load(final_model_path))
     test_metrics = validate(model, test_loader, real_bp_batch, real_ep_batch)
     
     # Canonical metrics artifact for summaries and downstream reporting.
@@ -609,6 +625,22 @@ def main():
         MODELS_TO_TRAIN = [m for m in MODELS_TO_TRAIN if m["name"] in args.models]
         if not MODELS_TO_TRAIN:
             raise ValueError(f"No valid models found matching {args.models}")
+
+    # Optional per-family hyperparameter overrides used by orchestration scripts.
+    for config in MODELS_TO_TRAIN:
+        if config["name"] == "baseline":
+            if args.mlp_learning_rate is not None:
+                config["learning_rate"] = args.mlp_learning_rate
+            if args.mlp_batch_size is not None:
+                config["batch_size"] = args.mlp_batch_size
+        if config["name"].startswith("sinkhorn"):
+            if args.sinkhorn_learning_rate is not None:
+                config["learning_rate"] = args.sinkhorn_learning_rate
+            if args.sinkhorn_batch_size is not None:
+                config["batch_size"] = args.sinkhorn_batch_size
+
+    for config in MODELS_TO_TRAIN:
+        config["epochs"] = args.epochs
     
     # Determine Output Directory
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -661,9 +693,8 @@ def main():
         f.write("========================================\n")
         f.write("Configuration:\n")
         f.write(f"  Replicates: {replicates_count}\n")
-        f.write(f"  Epochs: {NUM_EPOCHS}\n")
-        f.write(f"  Batch Size: {BATCH_SIZE}\n")
-        f.write(f"  Learning Rate: {LEARNING_RATE}\n")
+        f.write(f"  Epochs: {args.epochs}\n")
+        f.write("  Batch Size / Learning Rate: model-specific (see model list)\n")
         f.write("========================================\n")
         f.write("Statistics (Normalization):\n")
         # Ensure full numpy arrays are printed
@@ -677,7 +708,10 @@ def main():
         f.write("========================================\n")
         f.write("Models:\n")
         for m in MODELS_TO_TRAIN:
-            f.write(f"  - {m['name']} (Loss: {m['loss_fn'].__name__})\n")
+            f.write(
+                f"  - {m['name']} "
+                f"(Loss: {m['loss_fn'].__name__}, BS: {m['batch_size']}, LR: {m['learning_rate']})\n"
+            )
         
     # Launch Workers
     train_ds_args = (train_csv, None)
@@ -718,6 +752,10 @@ def main():
     except Exception as e:
         print(f"Aggregation failed: {e}")
 
+    if not run_eval_after_training:
+        print("Post-training evaluation skipped (--skip-evaluation).")
+        return
+
     if run_eval_after_training:
         try:
             run_post_training_evaluation(
@@ -732,8 +770,6 @@ def main():
             )
         except Exception as e:
             print(f"Post-training evaluation failed: {e}")
-    else:
-        print("Post-training evaluation skipped (--skip-evaluation).")
 
 if __name__ == "__main__":
     main()

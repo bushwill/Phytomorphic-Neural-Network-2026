@@ -22,6 +22,7 @@ import argparse
 from collections import defaultdict
 from statistics import mean, stdev
 from datetime import datetime
+import re
 
 OPT_PARAM_NAMES = [
     "max_phytomers",
@@ -38,6 +39,53 @@ OPT_PARAM_NAMES = [
     "int_wid",
     "exp_int_rad",
 ]
+
+
+def infer_dataset_metadata(base_dir):
+    """Infer dataset name and split sizes from tuning directory metadata."""
+    metadata = {
+        "dataset_name": "unknown",
+        "train_size": None,
+        "val_size": None,
+        "test_size": None,
+    }
+
+    desc_path = os.path.join(base_dir, "description.txt")
+    if os.path.exists(desc_path):
+        try:
+            with open(desc_path, "r") as f:
+                for line in f:
+                    if line.startswith("Dataset:"):
+                        metadata["dataset_name"] = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+    base_name = os.path.basename(os.path.abspath(base_dir))
+    name_source = metadata["dataset_name"] if metadata["dataset_name"] != "unknown" else base_name
+    split_match = re.search(r"(?P<train>\d+)_(?P<val>\d+)_(?P<test>\d+)", name_source)
+
+    if split_match:
+        metadata["train_size"] = int(split_match.group("train"))
+        metadata["val_size"] = int(split_match.group("val"))
+        metadata["test_size"] = int(split_match.group("test"))
+
+    return metadata
+
+
+def format_dataset_label(metadata):
+    """Build a concrete dataset label for summary headers."""
+    dataset_name = metadata.get("dataset_name", "unknown")
+    train_size = metadata.get("train_size")
+    val_size = metadata.get("val_size")
+    test_size = metadata.get("test_size")
+
+    if train_size is not None and val_size is not None and test_size is not None:
+        return (
+            f"{dataset_name} "
+            f"(Train: {train_size:,} | Val: {val_size:,} | Test: {test_size:,})"
+        )
+    return dataset_name
 
 
 def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
@@ -98,7 +146,7 @@ def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
     return results
 
 
-def generate_convergence_summary(results, summary_file):
+def generate_convergence_summary(results, summary_file, tuning_dir=""):
     """
     Generate comprehensive convergence analysis summary.
     
@@ -119,6 +167,9 @@ def generate_convergence_summary(results, summary_file):
         print("No convergence data found. Run convergence tests first.")
         return False
     
+    dataset_meta = infer_dataset_metadata(tuning_dir)
+    train_size = dataset_meta.get("train_size")
+
     with open(summary_file, 'w') as f:
         f.write("="*150 + "\n")
         f.write("CONVERGENCE ANALYSIS SUMMARY - Fraction-Based Learning Curves\n")
@@ -126,7 +177,7 @@ def generate_convergence_summary(results, summary_file):
         
         f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Plant: Plant_023-1\n")
-        f.write(f"Dataset: 20000 training samples (same distribution)\n")
+        f.write(f"Dataset: {format_dataset_label(dataset_meta)}\n")
         f.write(f"Configurations tested: {len(results)}\n\n")
         
         # Group by model, fraction, then epochs
@@ -134,7 +185,7 @@ def generate_convergence_summary(results, summary_file):
         for (model, frac, epochs), data_list in results.items():
             by_model_frac[model][frac].append((epochs, data_list))
         
-        # OPTIMIZED HYPERPARAMETER SETS
+        # OPTIMIZED HYPERPARAMETER SETS (LPFG cost first, R² retained)
         f.write("="*150 + "\n")
         f.write("OPTIMIZED HYPERPARAMETER SETS\n")
         f.write("="*150 + "\n\n")
@@ -158,7 +209,10 @@ def generate_convergence_summary(results, summary_file):
             for lr, bs in hp_sets:
                 f.write(f"  Hyperparameter Set: LR={lr:.1e}, BS={bs}\n")
                 f.write(f"  {'-'*146}\n")
-                f.write(f"  {'Fraction':<12} {'Epochs':<10} {'Avg R²':<12} {'Std R²':<12} {'R² Vector':<80}\n")
+                f.write(
+                    f"  {'Fraction':<12} {'Epochs':<10} {'Avg Cost':<12} {'Std Cost':<12} "
+                    f"{'Cost Vector':<28} {'Avg R²':<12} {'Std R²':<12} {'R² Vector':<28}\n"
+                )
                 f.write(f"  {'-'*146}\n")
                 
                 fractions = sorted(set(k[1] for k in results.keys() if k[0] == model))
@@ -170,12 +224,19 @@ def generate_convergence_summary(results, summary_file):
                             data_list = [d for d in results[key] if d['lr'] == lr and d['bs'] == bs]
                             if data_list:
                                 r2_vals = sorted([d['r2'] for d in data_list])
+                                cost_vals = sorted([d['cost'] for d in data_list])
                                 avg_r2 = mean(r2_vals)
                                 std_r2 = stdev(r2_vals) if len(r2_vals) > 1 else 0
+                                avg_cost = mean(cost_vals)
+                                std_cost = stdev(cost_vals) if len(cost_vals) > 1 else 0
                                 r2_str = " ".join(f"{v:.4f}" for v in r2_vals)
+                                cost_str = " ".join(f"{v:.0f}" for v in cost_vals)
                                 
                                 frac_pct = f"{frac*100:.0f}%"
-                                f.write(f"  {frac_pct:<12} {epochs:<10} {avg_r2:<12.4f} {std_r2:<12.4f} {r2_str:<80}\n")
+                                f.write(
+                                    f"  {frac_pct:<12} {epochs:<10} {avg_cost:<12.1f} {std_cost:<12.1f} "
+                                    f"{cost_str:<28} {avg_r2:<12.4f} {std_r2:<12.4f} {r2_str:<28}\n"
+                                )
                 
                 f.write("\n")
         
@@ -190,13 +251,20 @@ def generate_convergence_summary(results, summary_file):
             # By fraction
             for frac in sorted(by_model_frac[model].keys()):
                 frac_pct = frac * 100
-                data_size = int(20000 * frac)
+                data_size = int(train_size * frac) if train_size is not None else None
                 f.write(f"\n  {'='*145}\n")
-                f.write(f"  DATA FRACTION: {frac_pct:.0f}% ({data_size:,} samples)\n")
+                if data_size is None:
+                    f.write(f"  DATA FRACTION: {frac_pct:.0f}% (unknown samples)\n")
+                else:
+                    f.write(f"  DATA FRACTION: {frac_pct:.0f}% ({data_size:,} samples)\n")
                 f.write(f"  {'='*145}\n\n")
                 
                 # Summary statistics table
                 f.write(f"  {'Epochs':<10} {'Avg R²':<12} {'Std R²':<12} {'R² Range':<25} {'R² Values':<50}\n")
+                f.write(
+                    f"  {'Epochs':<10} {'Avg Cost':<12} {'Std Cost':<12} {'Cost Range':<25} {'Cost Values':<28} "
+                    f"{'Avg R²':<12} {'Std R²':<12} {'R² Values':<28}\n"
+                )
                 f.write(f"  {'-'*140}\n")
                 
                 epoch_list = sorted(by_model_frac[model][frac])
@@ -208,13 +276,20 @@ def generate_convergence_summary(results, summary_file):
                     std_r2 = stdev(r2_vals) if len(r2_vals) > 1 else 0
                     avg_cost = mean(cost_vals)
                     std_cost = stdev(cost_vals) if len(cost_vals) > 1 else 0
+                    min_cost = min(cost_vals)
+                    max_cost = max(cost_vals)
                     min_r2 = min(r2_vals)
                     max_r2 = max(r2_vals)
                     
+                    cost_range = f"[{min_cost:.1f}, {max_cost:.1f}]"
+                    cost_str = " ".join(f"{v:.0f}" for v in sorted(cost_vals))
                     r2_range = f"[{min_r2:.4f}, {max_r2:.4f}]"
                     r2_str = " ".join(f"{v:.4f}" for v in r2_vals)
                     
-                    f.write(f"  {epochs:<10} {avg_r2:<12.4f} {std_r2:<12.4f} {r2_range:<25} {r2_str:<50}\n")
+                    f.write(
+                        f"  {epochs:<10} {avg_cost:<12.1f} {std_cost:<12.1f} {cost_range:<25} {cost_str:<28} "
+                        f"{avg_r2:<12.4f} {std_r2:<12.4f} {r2_str:<28}\n"
+                    )
                 
                 # Detailed per-replicate breakdown
                 f.write(f"\n  DETAILED REPLICATE BREAKDOWN:\n")
@@ -226,8 +301,9 @@ def generate_convergence_summary(results, summary_file):
                     f.write(f"    {'-'*60}\n")
                     
                     for data in sorted(data_list, key=lambda x: x['replicate']):
-                        est_samples = int(20000 * frac)
-                        f.write(f"    {data['replicate']:<5} {data['r2']:<12.4f} {data['cost']:<15.1f} {data['lr']:<10.1e} {data['bs']:<5} {est_samples:<15,}\n")
+                        est_samples = int(train_size * frac) if train_size is not None else None
+                        est_samples_str = f"{est_samples:,}" if est_samples is not None else "unknown"
+                        f.write(f"    {data['replicate']:<5} {data['r2']:<12.4f} {data['cost']:<15.1f} {data['lr']:<10.1e} {data['bs']:<5} {est_samples_str:<15}\n")
                 
                 f.write(f"\n  OPTIMIZED L-SYSTEM PARAMETER SETS (per replicate):\n")
                 f.write(f"  {'-'*140}\n")
@@ -261,8 +337,11 @@ def generate_convergence_summary(results, summary_file):
         
         for frac in fractions:
             frac_pct = frac * 100
-            data_size = int(20000 * frac)
-            f.write(f"\nData Fraction: {frac_pct:.0f}% ({data_size:,} samples)\n")
+            data_size = int(train_size * frac) if train_size is not None else None
+            if data_size is None:
+                f.write(f"\nData Fraction: {frac_pct:.0f}% (unknown samples)\n")
+            else:
+                f.write(f"\nData Fraction: {frac_pct:.0f}% ({data_size:,} samples)\n")
             f.write(f"{'-'*140}\n")
             f.write(f"{'Epochs':<10} {'Model':<12} {'Avg R²':<12} {'Std R²':<12} {'Avg Cost':<15} {'Std Cost':<15} {'Min/Max Cost':<20}\n")
             f.write(f"{'-'*140}\n")
@@ -291,7 +370,7 @@ def generate_convergence_summary(results, summary_file):
         f.write("KEY FINDINGS & RECOMMENDATIONS:\n")
         f.write("="*150 + "\n\n")
         
-        f.write("1. LEARNING CURVES (Performance vs Data Fraction at Max Epochs):\n\n")
+        f.write("1. LEARNING CURVES (LPFG Cost primary, R² secondary at Max Epochs):\n\n")
         for model in models:
             f.write(f"   {model.upper()}:\n")
             best_epochs = max(epoch_counts)
@@ -303,7 +382,7 @@ def generate_convergence_summary(results, summary_file):
                     cost_vals = [d['cost'] for d in results[key]]
                     avg_r2 = mean(r2_vals)
                     avg_cost = mean(cost_vals)
-                    f.write(f"     {frac_pct:>5.0f}% → R²={avg_r2:.4f}  Cost={avg_cost:.0f}\n")
+                    f.write(f"     {frac_pct:>5.0f}% → Cost={avg_cost:.0f}  R²={avg_r2:.4f}\n")
             f.write("\n")
         
         f.write("2. EARLY STOPPING EFFECTIVENESS (% of max epochs used):\n\n")
@@ -324,10 +403,10 @@ def generate_convergence_summary(results, summary_file):
                     f.write(f"     {frac_pct:>5.0f}% → {avg_ratio:.1%} of max epochs (early stopping effective: {avg_ratio < 0.6})\n")
             f.write("\n")
         
-        f.write("3. MODEL COMPARISON AT FULL DATA (100%):\n\n")
+        f.write("3. MODEL COMPARISON AT FULL DATA (100%, LPFG Cost first):\n\n")
         best_epochs = max(epoch_counts)
         f.write(f"   At {best_epochs} max epochs (best configuration):\n\n")
-        f.write(f"   {'Model':<12} {'Avg R²':<12} {'Std R²':<12} {'Avg Cost':<15} {'Best Cost':<15}\n")
+        f.write(f"   {'Model':<12} {'Avg Cost':<15} {'Best Cost':<15} {'Avg R²':<12} {'Std R²':<12}\n")
         f.write(f"   {'-'*60}\n")
         
         for model in sorted(models):
@@ -339,9 +418,9 @@ def generate_convergence_summary(results, summary_file):
                 std_r2 = stdev(r2_vals) if len(r2_vals) > 1 else 0
                 avg_cost = mean(cost_vals)
                 best_cost = min(cost_vals)
-                f.write(f"   {model:<12} {avg_r2:<12.4f} {std_r2:<12.4f} {avg_cost:<15.1f} {best_cost:<15.1f}\n")
-        
-        f.write("\n4. MINIMUM DATA FOR CONVERGENCE (>90% R²):\n\n")
+                f.write(f"   {model:<12} {avg_cost:<15.1f} {best_cost:<15.1f} {avg_r2:<12.4f} {std_r2:<12.4f}\n")
+
+            f.write("\n4. MINIMUM DATA FOR CONVERGENCE (>90% R², with LPFG Cost shown):\n\n")
         for model in models:
             f.write(f"   {model.upper()}:\n")
             best_epochs = max(epoch_counts)
@@ -351,12 +430,18 @@ def generate_convergence_summary(results, summary_file):
             for frac in fractions:
                 key = (model, frac, best_epochs)
                 if key in results:
-                    r2_vals = [d['r2'] for d in results[key]]
+                    data_list = results[key]
+                    r2_vals = [d['r2'] for d in data_list]
+                    cost_vals = [d['cost'] for d in data_list]
                     avg_r2 = mean(r2_vals)
+                    avg_cost = mean(cost_vals)
                     
                     if avg_r2 >= threshold and not found_threshold:
-                        data_size = int(20000 * frac)
-                        f.write(f"     ✓ {frac*100:.0f}% fraction ({data_size:,} samples) → R²={avg_r2:.4f}\n")
+                        data_size = int(train_size * frac) if train_size is not None else None
+                        if data_size is None:
+                            f.write(f"     ✓ {frac*100:.0f}% fraction (unknown samples) → Cost={avg_cost:.0f}, R²={avg_r2:.4f}\n")
+                        else:
+                            f.write(f"     ✓ {frac*100:.0f}% fraction ({data_size:,} samples) → Cost={avg_cost:.0f}, R²={avg_r2:.4f}\n")
                         found_threshold = True
             
             if not found_threshold:
@@ -364,6 +449,8 @@ def generate_convergence_summary(results, summary_file):
             f.write("\n")
         
         f.write("5. RECOMMENDATIONS:\n\n")
+        f.write("   • Prioritize lower LPFG cost when selecting final configurations\n")
+        f.write("   • Use R² as a secondary model-quality indicator, not the primary objective\n")
         f.write("   • Use minimum fraction that achieves >90% R² for efficient training\n")
         f.write("   • Lower early stopping % ratio indicates better generalization potential\n")
         f.write("   • Monitor if cost increases while R² plateaus (overfitting indicator)\n")
@@ -399,7 +486,7 @@ def main():
         return 1
     
     # Generate summary
-    if generate_convergence_summary(results, args.summary_file):
+    if generate_convergence_summary(results, args.summary_file, args.tuning_dir):
         print(f"✓ Convergence summary: {args.summary_file}")
         return 0
     else:
