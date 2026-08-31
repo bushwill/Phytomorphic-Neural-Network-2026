@@ -20,19 +20,19 @@ def main():
     
     # Typical baseline values for the L-system parameters
     params = {
-        "MAX_PHYTOMERS": 10.0,
-        "PLASTOCHRON": 3.0,
-        "PlantRollAng": 40.0,  # Rotated 40 degrees to give a clear 3D/isometric perspective
-        "PlantDownAng": 0.0,
-        "BrAngle": 135.0,
-        "LeafLen": 5.0,
-        "ExpLeafWid": 0.5,
-        "LeafWid": 1.0,
-        "LEAF_BEND_SCALE": 90.0,
-        "LEAF_TWIST_SCALE": 180.0,
-        "IntLen": 0.7,
-        "IntWid": 0.9,
-        "ExpIntRad": 0.5
+        "MAX_PHYTOMERS": 8.018020629882812,
+        "PLASTOCHRON": 2.9809889793395996,
+        "PlantRollAng": 90,  # Rotated 40 degrees to give a clear 3D/isometric perspective
+        "PlantDownAng": -0.10986749082803726,
+        "BrAngle": 145.00344848632812,
+        "LeafLen": 3.2131049633026123,
+        "ExpLeafWid": 0.5193671584129333,
+        "LeafWid": 0.9655371308326721,
+        "LEAF_BEND_SCALE": 89.20584106445312,
+        "LEAF_TWIST_SCALE": 182.83705139160156,
+        "IntLen": 0.6003348231315613,
+        "IntWid": 0.879999577999115,
+        "ExpIntRad": 0.5039083361625671
     }
 
     # You can change these parameters if you want to test specific bounded extremes (e.g. plastochron 2.8 vs 3.2)

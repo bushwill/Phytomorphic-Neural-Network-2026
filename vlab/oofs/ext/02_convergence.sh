@@ -10,6 +10,9 @@ CONV_FRACTIONS=(0.25 0.5 1.0)
 CONV_EPOCH_CONFIGS=("25 5" "50 10")
 CONV_REPLICATES=2
 
+# If set to 1, Stage 2 always starts from a clean convergence directory.
+STAGE02_FORCE_RERUN=0
+
 # hp sets from step 1
 MLP_LR="1e-3"
 MLP_BS="1"
@@ -21,9 +24,15 @@ OPT_STEPS=250
 
 CONV_DATASET_NAME="${PLANT_NAME}-50000_10000_25000"
 
-QUICK_CONV_DIR="Convergence Tests/Convergence_${CONV_DATASET_NAME}"
+QUICK_CONV_DIR_BASE="Convergence Tests/Convergence_${CONV_DATASET_NAME}"
+if [[ "$STAGE02_FORCE_RERUN" == "1" ]]; then
+    QUICK_CONV_DIR="${QUICK_CONV_DIR_BASE}_rerun_$(date +%Y%m%d_%H%M%S)"
+else
+    QUICK_CONV_DIR="$QUICK_CONV_DIR_BASE"
+fi
 LOG_FILE="Research Pipeline/02_convergence.log"
-mkdir -m 777 -p "$(dirname "$LOG_FILE")" "$QUICK_CONV_DIR"
+mkdir -m 777 -p "$(dirname "$LOG_FILE")"
+mkdir -m 777 -p "$QUICK_CONV_DIR"
 
 log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $1" | tee -a "$LOG_FILE"; }
 
@@ -54,7 +63,7 @@ PY
 
 log "=== STAGE 2: Quick Convergence ==="
 
-if stage2_complete; then
+if [[ "$STAGE02_FORCE_RERUN" != "1" ]] && stage2_complete; then
     log "Stage 2 already complete (all expected convergence jobs found). Skipping rerun."
     log "=== STAGE 2 COMPLETE ==="
     exit 0

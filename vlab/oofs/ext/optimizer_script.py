@@ -422,8 +422,8 @@ def _extract_optimizer_record(result_path):
         return None
 
     row = {
-        "best_pred_lpfg_cost": _safe_float(record.get("surrogate_pred_cost", "nan")),
-        "best_lpfg_cost_optimized_true": _safe_float(record.get("verified_sim_cost", "nan")),
+        "best_pred_vlab_cost": _safe_float(record.get("surrogate_pred_cost", "nan")),
+        "best_vlab_cost_optimized_true": _safe_float(record.get("verified_sim_cost", "nan")),
     }
 
     for idx, name in enumerate(LSYSTEM_PARAM_NAMES):
@@ -431,7 +431,7 @@ def _extract_optimizer_record(result_path):
         legacy_key = f"param_{idx}"
         row[f"best_{name}"] = _safe_float(record.get(named_key, record.get(legacy_key, "nan")))
 
-    row["optimized_true"] = bool(np.isfinite(row["best_lpfg_cost_optimized_true"]))
+    row["optimized_true"] = bool(np.isfinite(row["best_vlab_cost_optimized_true"]))
     return row
 
 
@@ -474,7 +474,7 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
 
     summary_results_path = os.path.join(run_output_dir, "summary_results.csv")
     summary_by_model_path = os.path.join(run_output_dir, "summary_by_model.csv")
-    best_lpfg_report_path = os.path.join(run_output_dir, "best_lpfg_report.csv")
+    best_vlab_report_path = os.path.join(run_output_dir, "best_vlab_report.csv")
 
     # Load training tuning R2 values if provided
     tuning_r2_map = _load_tuning_r2_map(run_dir) if run_dir else {}
@@ -526,8 +526,8 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
         "optimizer_run",
         "relative_path",
         "selection_basis",
-        "best_pred_lpfg_cost",
-        "best_lpfg_cost_optimized_true",
+        "best_pred_vlab_cost",
+        "best_vlab_cost_optimized_true",
         "best_val_r2",
         "optimized_true",
     ] + [f"best_{name}" for name in LSYSTEM_PARAM_NAMES]
@@ -543,8 +543,8 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
         grouped.setdefault(row.get("model_name", "unknown"), []).append(row)
 
     def rank_row(row):
-        verified_cost = row.get("best_lpfg_cost_optimized_true", float("nan"))
-        pred_cost = row.get("best_pred_lpfg_cost", float("nan"))
+        verified_cost = row.get("best_vlab_cost_optimized_true", row.get("best_lpfg_cost_optimized_true", float("nan")))
+        pred_cost = row.get("best_pred_vlab_cost", row.get("best_pred_lpfg_cost", float("nan")))
         if np.isfinite(verified_cost):
             return (0, verified_cost, pred_cost)
         return (1, pred_cost, verified_cost)
@@ -555,8 +555,8 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
         "n_verified",
         "best_replicate",
         "selection_basis",
-        "best_pred_lpfg_cost",
-        "best_lpfg_cost_optimized_true",
+        "best_pred_vlab_cost",
+        "best_vlab_cost_optimized_true",
         "best_val_r2",
         "optimized_true",
     ] + [f"best_{name}" for name in LSYSTEM_PARAM_NAMES]
@@ -569,11 +569,11 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
             writer.writerow({
                 "model_name": model_name,
                 "n_runs": len(model_rows),
-                "n_verified": sum(1 for row in model_rows if np.isfinite(row.get("best_lpfg_cost_optimized_true", float("nan")))),
+                "n_verified": sum(1 for row in model_rows if np.isfinite(row.get("best_vlab_cost_optimized_true", row.get("best_lpfg_cost_optimized_true", float("nan"))))),
                 "best_replicate": best_row.get("replicate", ""),
                 "selection_basis": best_row.get("selection_basis", ""),
-                "best_pred_lpfg_cost": best_row.get("best_pred_lpfg_cost", ""),
-                "best_lpfg_cost_optimized_true": best_row.get("best_lpfg_cost_optimized_true", ""),
+                "best_pred_vlab_cost": best_row.get("best_pred_vlab_cost", row.get("best_pred_lpfg_cost", "")),
+                "best_vlab_cost_optimized_true": best_row.get("best_vlab_cost_optimized_true", row.get("best_lpfg_cost_optimized_true", "")),
                 "best_val_r2": best_row.get("best_val_r2", ""),
                 "optimized_true": best_row.get("optimized_true", ""),
                 **{f"best_{name}": best_row.get(f"best_{name}", "") for name in LSYSTEM_PARAM_NAMES},
@@ -587,13 +587,13 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
         "model_name",
         "replicate",
         "selection_basis",
-        "best_lpfg_cost_optimized_true",
-        "best_pred_lpfg_cost",
+        "best_vlab_cost_optimized_true",
+        "best_pred_vlab_cost",
         "best_val_r2",
         "optimized_true",
         "relative_path",
     ]
-    with open(best_lpfg_report_path, "w", newline="") as f:
+    with open(best_vlab_report_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=best_report_fields)
         writer.writeheader()
         for idx, row in enumerate(ranked_rows, start=1):
@@ -604,8 +604,8 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
                 "model_name": row.get("model_name", ""),
                 "replicate": row.get("replicate", ""),
                 "selection_basis": row.get("selection_basis", ""),
-                "best_lpfg_cost_optimized_true": row.get("best_lpfg_cost_optimized_true", ""),
-                "best_pred_lpfg_cost": row.get("best_pred_lpfg_cost", ""),
+                "best_vlab_cost_optimized_true": row.get("best_vlab_cost_optimized_true", row.get("best_lpfg_cost_optimized_true", "")),
+                "best_pred_vlab_cost": row.get("best_pred_vlab_cost", row.get("best_pred_lpfg_cost", "")),
                 "best_val_r2": row.get("best_val_r2", ""),
                 "optimized_true": row.get("optimized_true", ""),
                 "relative_path": row.get("relative_path", ""),
@@ -613,7 +613,7 @@ def build_optimizer_summaries(run_output_dir, run_dir=None):
 
     logging.info(f"Summary saved to {summary_results_path}")
     logging.info(f"Model summary saved to {summary_by_model_path}")
-    logging.info(f"Best LPFG report saved to {best_lpfg_report_path}")
+    logging.info(f"Best LPFG report saved to {best_vlab_report_path}")
 
 def optimize_params_for_model(model, model_type, real_bp_batch, real_ep_batch, args):
     """

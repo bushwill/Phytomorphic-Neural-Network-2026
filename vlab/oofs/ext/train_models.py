@@ -22,6 +22,7 @@ import time
 import argparse
 import shutil
 import json
+import math
 import numpy as np
 from datetime import datetime
 import torch
@@ -160,12 +161,25 @@ def parse_arguments():
                         help="Override batch size for sinkhorn model(s)")
     return parser.parse_known_args()[0]
 
+
+def resolve_thread_budget(available_cores, total_workers):
+    """Choose a thread budget that scales with the machine and worker count."""
+    available_cores = max(1, int(available_cores or 1))
+    total_workers = max(1, int(total_workers or 1))
+
+    if total_workers > 1:
+        return max(1, available_cores // total_workers)
+
+    # Single-worker case: use a sublinear budget so larger machines help,
+    # but we avoid the thread-overhead cliff seen when PyTorch uses every core.
+    return max(1, min(available_cores, int(round(2 * math.sqrt(available_cores)))))
+
 # --- UTILS ---
 
 
 
 def train_one_epoch(model, loader, optimizer, real_bp_batch, real_ep_batch, 
-                   real_bp_raw, real_ep_raw, model_config, training_log_csv=None, epoch_num=1):
+                   real_bp_raw, real_ep_raw, model_config, epoch_num=1):
     """
     Executes one full epoch of training.
     
@@ -265,13 +279,10 @@ def train_one_epoch(model, loader, optimizer, real_bp_batch, real_ep_batch,
         
         total_loss += loss.item()
         
-        # 7. Log
+        # 7. Log console progress only. CSV logging is done once per epoch by caller.
         if batch_idx == 0 or (batch_idx + 1) % 10 == 0:
             current_loss = loss.item()
             print(f"[{model_config['name']}] Epoch {epoch_num} Batch {batch_idx + 1}/{total_batches} Loss: {current_loss:.4f}", flush=True)
-            if training_log_csv:
-                with open(training_log_csv, "a") as f:
-                    f.write(f"{epoch_num},{batch_idx + 1},{current_loss:.6f},,,,\n")
         
         batch_idx += 1
         
@@ -345,10 +356,19 @@ def validate(model, loader, real_bp_batch, real_ep_batch):
 def train_model_worker(config, run_dir, input_mean, input_std, output_mean, output_std, 
                       real_bp_batch, real_ep_batch, real_bp, real_ep, 
                       train_ds_args, val_ds_args, test_ds_args, replicate_id=1,
-                      total_replicates=1, use_multiprocessing=True):
+                      total_replicates=1, use_multiprocessing=True, num_threads=None):
     """
     Train one model instance and save its outputs into a single folder.
     """
+
+    # Limit intra-op threads to prevent over-subscription on high core-count machines.
+    # PyTorch defaults to all available cores, which causes severe overhead for the
+    # small matrix operations in the Sinkhorn loss (e.g. 48 threads > 24 threads = 2x slower).
+    # num_threads is calculated by the caller from the current machine size.
+    if num_threads is None:
+        num_threads = resolve_thread_budget(os.cpu_count(), total_replicates if use_multiprocessing else 1)
+    torch.set_num_threads(int(num_threads))
+    torch.set_num_interop_threads(1)
 
     # Seeding for reproducibility
     current_seed = 42 + replicate_id
@@ -421,7 +441,6 @@ def train_model_worker(config, run_dir, input_mean, input_std, output_mean, outp
             real_bp_batch, real_ep_batch, 
             real_bp, real_ep,
             config,
-            training_log_csv=log_csv,
             epoch_num=epoch+1
         )
         
@@ -717,7 +736,16 @@ def main():
     train_ds_args = (train_csv, None)
     val_ds_args = (val_csv, None)
     test_ds_args = (test_csv, None)
-    
+
+    # Distribute CPU cores evenly across all parallel workers.
+    # With multiprocessing, each worker gets cpu_count // total_workers threads.
+    # With sequential execution, use a sublinear budget so larger machines still
+    # help without hitting the overhead cliff from all-core threading.
+    total_parallel_workers = len(MODELS_TO_TRAIN) * replicates_count if use_multi else 1
+    available_cores = os.cpu_count() or 1
+    threads_per_worker = resolve_thread_budget(available_cores, total_parallel_workers)
+    print(f"[Config] Workers: {total_parallel_workers} | Cores: {available_cores} | Threads/worker: {threads_per_worker}")
+
     pipeline_start = time.time()
     
     if use_multi:
@@ -727,7 +755,8 @@ def main():
                 p = mp.Process(target=train_model_worker, args=(
                     config, run_output_dir, input_mean, input_std, output_mean, output_std,
                     real_bp_batch, real_ep_batch, real_bp, real_ep,
-                    train_ds_args, val_ds_args, test_ds_args, rep, replicates_count, True
+                    train_ds_args, val_ds_args, test_ds_args, rep, replicates_count, True,
+                    threads_per_worker
                 ))
                 p.start()
                 processes.append(p)
@@ -741,7 +770,8 @@ def main():
                 train_model_worker(
                     config, run_output_dir, input_mean, input_std, output_mean, output_std,
                     real_bp_batch, real_ep_batch, real_bp, real_ep,
-                    train_ds_args, val_ds_args, test_ds_args, rep, replicates_count, False
+                    train_ds_args, val_ds_args, test_ds_args, rep, replicates_count, False,
+                    threads_per_worker
                 )
                 
     full_duration = time.time() - pipeline_start

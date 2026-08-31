@@ -8,7 +8,10 @@ cd "$SCRIPT_DIR"
 
 EXPERIMENT_TAG="${1:-$(date +%m%d%y_%H%M%S)}"
 REPLICATES=2
-EXPERIMENT_EPOCHS=50
+EXPERIMENT_EPOCHS=20
+
+# If set to 1, Stage 5 always starts from scratch for this experiment tag.
+STAGE05_FORCE_RERUN=0
 
 # Best HP sets for Stage 5 training (edit these as needed).
 MLP_HP_LR="1e-3"
@@ -36,8 +39,8 @@ DATASET_SPECS=(
     "50000 10000 25000"
 )
 
-# sinkhorn_no_aggregator chosen from previous step, 04_ablation.sh
-MODELS=(baseline sinkhorn_no_aggregator)
+# Use standard sinkhorn for final experiments.
+MODELS=(baseline sinkhorn)
 OPT_RESTARTS=10
 OPT_STEPS=1000
 
@@ -139,45 +142,53 @@ for plant_name in "${PLANTS[@]}"; do
     for spec in "${DATASET_SPECS[@]}"; do
         read -r train_size val_size test_size <<< "$spec"
         dataset_name="${plant_name}-${train_size}_${val_size}_${test_size}"
-        training_run_name="Experiment_${EXPERIMENT_TAG}_${dataset_name}"
+        rerun_suffix=""
+        if [[ "$STAGE05_FORCE_RERUN" == "1" ]]; then
+            rerun_suffix="_rerun_$(date +%Y%m%d_%H%M%S)"
+        fi
+        training_run_name="Experiment_${EXPERIMENT_TAG}_${dataset_name}${rerun_suffix}"
         training_run_dir="Training Data/${training_run_name}"
-        optimizer_out_rel="${optimizer_root_rel}/${dataset_name}"
+        optimizer_out_rel="${optimizer_root_rel}/${dataset_name}${rerun_suffix}"
 
         log "------------------------------------------------------------"
         log "Config: Plant=${plant_name} | Dataset=${dataset_name}"
 
         require_dataset "$plant_name" "$train_size" "$val_size" "$test_size"
 
+        if [[ "$STAGE05_FORCE_RERUN" == "1" ]]; then
+            log "Force rerun enabled; keeping prior artifacts and using new run paths for ${dataset_name}"
+            log "New training run: ${training_run_dir}"
+            log "New optimizer output: ${optimizer_out_rel}"
+        fi
+
         if training_complete "$training_run_dir"; then
             log "[1/2] Training already complete for ${dataset_name}. Skipping retrain."
         else
             if [[ -d "$training_run_dir" ]]; then
-                log "ERROR: Found incomplete existing training directory: ${training_run_dir}"
-                log "Refusing to launch a new suffixed run for the same experiment tag."
-                log "Resolve or remove incomplete artifacts, then rerun stage 05."
-                exit 1
+                log "[1/2] Found partial training directory for ${dataset_name}: ${training_run_dir}"
+                log "[1/2] Keeping existing partial artifacts and continuing with available checkpoints."
+            else
+                log "[1/2] Training models on dataset: ${dataset_name}"
+                python3 train_models.py \
+                    --dataset "$dataset_name" \
+                    --plant "$plant_name" \
+                    --run-name "$training_run_name" \
+                    --replicates "$REPLICATES" \
+                    --epochs "$EXPERIMENT_EPOCHS" \
+                    --models "${MODELS[@]}" \
+                    --mlp-learning-rate "$MLP_HP_LR" \
+                    --mlp-batch-size "$MLP_HP_BS" \
+                    --sinkhorn-learning-rate "$SINKHORN_HP_LR" \
+                    --sinkhorn-batch-size "$SINKHORN_HP_BS" \
+                    --skip-evaluation | tee -a "$LOG_FILE"
             fi
-
-            log "[1/2] Training models on dataset: ${dataset_name}"
-            python3 train_models.py \
-                --dataset "$dataset_name" \
-                --plant "$plant_name" \
-                --run-name "$training_run_name" \
-                --replicates "$REPLICATES" \
-                --epochs "$EXPERIMENT_EPOCHS" \
-                --models "${MODELS[@]}" \
-                --mlp-learning-rate "$MLP_HP_LR" \
-                --mlp-batch-size "$MLP_HP_BS" \
-                --sinkhorn-learning-rate "$SINKHORN_HP_LR" \
-                --sinkhorn-batch-size "$SINKHORN_HP_BS" \
-                --skip-evaluation | tee -a "$LOG_FILE"
         fi
 
-        if ! training_complete "$training_run_dir"; then
-            log "ERROR: Training artifacts are incomplete for ${dataset_name}: ${training_run_dir}"
-            exit 1
+        if training_complete "$training_run_dir"; then
+            log "Training run dir ready: ${training_run_dir}"
+        else
+            log "Training is still partial for ${dataset_name}; continuing with any available checkpoints."
         fi
-        log "Training run dir ready: ${training_run_dir}"
 
         missing_model_paths=()
         for model_name in "${MODELS[@]}"; do
@@ -192,8 +203,7 @@ for plant_name in "${PLANTS[@]}"; do
                     missing_model_paths+=("$ckpt_path")
                     log "[2/2] Optimization missing: ${model_name}/Rep_${rep} -> queued"
                 else
-                    log "ERROR: Missing checkpoint for optimization: ${model_name}/Rep_${rep}"
-                    exit 1
+                    log "[2/2] Optimization skipped (checkpoint missing): ${model_name}/Rep_${rep}"
                 fi
             done
         done

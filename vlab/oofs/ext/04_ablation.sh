@@ -10,10 +10,12 @@ DATASET_SPECS=(
     "50000 10000 25000"
 )
 
+# If set to 1, Stage 4 always starts from scratch per dataset.
+STAGE04_FORCE_RERUN=0
+
 ABLATION_REPLICATES=2
 ABLATION_EPOCHS=20
-# Keep patience above the epoch budget so every run reaches the full 20 epochs.
-ABLATION_PATIENCE=999
+ABLATION_PATIENCE=20
 ABLATION_FRACTION=1.0
 
 SINKHORN_LR="0.0005"
@@ -88,7 +90,7 @@ for row in rows:
         r2_values.append(value)
 
     try:
-        cost = float(row.get("best_lpfg_cost", "nan"))
+        cost = float(row.get("best_vlab_cost", row.get("best_lpfg_cost", "nan")))
     except Exception:
         cost = float("nan")
     if math.isfinite(cost):
@@ -107,8 +109,8 @@ if not lpfg_values and not r2_values:
 
 parts = [f"Metric summary for {model_name}:"]
 if lpfg_values:
-    parts.append(f"best_lpfg_cost_min={min(lpfg_values):.3f}")
-    parts.append(f"best_lpfg_cost_mean={sum(lpfg_values)/len(lpfg_values):.3f}")
+    parts.append(f"best_vlab_cost_min={min(lpfg_values):.3f}")
+    parts.append(f"best_vlab_cost_mean={sum(lpfg_values)/len(lpfg_values):.3f}")
 if surrogate_values:
     parts.append(f"best_lpfg_surrogate_cost_min={min(surrogate_values):.3f}")
 if r2_values:
@@ -119,7 +121,6 @@ print(" | ".join(parts))
 PY
 }
 
-# The structure-generation path is fixed in the base model; this stage isolates Sinkhorn-side simplifications.
 ABLATION_MODELS=("sinkhorn" "sinkhorn_no_encoder" "sinkhorn_no_scaler" "sinkhorn_no_aggregator" "sinkhorn_hollow")
 
 log "=== STAGE 4: Sinkhorn Ablation Tests ==="
@@ -127,13 +128,22 @@ log "=== STAGE 4: Sinkhorn Ablation Tests ==="
 for spec in "${DATASET_SPECS[@]}"; do
     read -r train_size val_size test_size <<< "$spec"
     dataset_name="${PLANT_NAME}-${train_size}_${val_size}_${test_size}"
-    optimizer_stage_dir="${ABLATION_ROOT}/${dataset_name}/sinkhorn_ablation/optimizer"
+    run_dir_base="${ABLATION_ROOT}/${dataset_name}/sinkhorn_ablation"
 
-    if stage4_complete "$optimizer_stage_dir"; then
+    if [[ "$STAGE04_FORCE_RERUN" == "1" ]]; then
+        run_dir="${run_dir_base}_rerun_$(date +%Y%m%d_%H%M%S)"
+        log "Force rerun enabled; keeping prior ablation artifacts and using new run dir: ${run_dir}"
+    else
+        run_dir="$run_dir_base"
+    fi
+
+    optimizer_stage_dir="${run_dir}/optimizer"
+
+    if [[ "$STAGE04_FORCE_RERUN" != "1" ]] && stage4_complete "$optimizer_stage_dir"; then
         log "Stage 4 already complete for ${dataset_name} (all expected optimizer outputs found). Skipping rerun."
         python3 optimizer_script.py \
             --summary_only \
-            --run_dir "${ABLATION_ROOT}/${dataset_name}/sinkhorn_ablation" \
+            --run_dir "$run_dir" \
             --output_dir "$optimizer_stage_dir" | tee -a "$LOG_FILE" || {
                 log "Summary-only aggregation failed for ablation optimizer outputs on $dataset_name"
         }
@@ -141,7 +151,7 @@ for spec in "${DATASET_SPECS[@]}"; do
     fi
 
     for model_name in "${ABLATION_MODELS[@]}"; do
-        stage_dir="${ABLATION_ROOT}/${dataset_name}/sinkhorn_ablation/${model_name}"
+        stage_dir="${run_dir}/${model_name}"
         mkdir -m 777 -p "$stage_dir"
         log "Running ablation model: $model_name on dataset: $dataset_name -> $stage_dir"
 
@@ -167,7 +177,6 @@ for spec in "${DATASET_SPECS[@]}"; do
         log_tuning_metrics "$stage_dir/tuning_summary.csv" "$model_name"
     done
 
-    run_dir="${ABLATION_ROOT}/${dataset_name}/sinkhorn_ablation"
     mkdir -m 777 -p "$optimizer_stage_dir"
 
     missing_model_paths=()

@@ -47,7 +47,7 @@ def generate_replicate_summary(tuning_dir, output_file):
         model = row['model']
         hp_sets[model].append({
             'r2': float(row['best_val_r2']),
-            'cost': float(row['best_lpfg_cost']),
+            'cost': float(row.get('best_vlab_cost', row.get('best_lpfg_cost'))),
             'replicate': int(row['replicate']),
             'learning_rate': float(row['learning_rate']),
             'batch_size': int(row['batch_size']),

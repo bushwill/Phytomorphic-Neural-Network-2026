@@ -10,6 +10,9 @@ DATASET_SPECS=(
     "50000 10000 25000"
 )
 
+# If set to 1, Stage 3 always starts from a clean final HP tuning directory.
+STAGE03_FORCE_RERUN=0
+
 FINAL_HP_REPLICATES=2
 FINAL_HP_EPOCHS=50
 FINAL_HP_PATIENCE=10
@@ -23,9 +26,15 @@ FINAL_SINKHORN_BS=(8 16 32)
 OPT_RESTARTS=3
 OPT_STEPS=250
 
-FINAL_HP_ROOT="Final HP Tune/${PLANT_NAME}"
+FINAL_HP_ROOT_BASE="Final HP Tune/${PLANT_NAME}"
+if [[ "$STAGE03_FORCE_RERUN" == "1" ]]; then
+    FINAL_HP_ROOT="${FINAL_HP_ROOT_BASE}_rerun_$(date +%Y%m%d_%H%M%S)"
+else
+    FINAL_HP_ROOT="$FINAL_HP_ROOT_BASE"
+fi
 LOG_FILE="Research Pipeline/03_final_hp_tuning.log"
-mkdir -m 777 -p "${FINAL_HP_ROOT}" "$(dirname "$LOG_FILE")"
+mkdir -m 777 -p "$(dirname "$LOG_FILE")"
+mkdir -m 777 -p "${FINAL_HP_ROOT}"
 
 log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $1" | tee -a "$LOG_FILE"; }
 
@@ -56,7 +65,7 @@ PY
 
 log "=== STAGE 3: Quick Final HP Tune ==="
 
-if stage3_complete; then
+if [[ "$STAGE03_FORCE_RERUN" != "1" ]] && stage3_complete; then
     log "Stage 3 already complete (all expected final HP jobs found). Skipping rerun."
     log "=== STAGE 3 COMPLETE ==="
     exit 0

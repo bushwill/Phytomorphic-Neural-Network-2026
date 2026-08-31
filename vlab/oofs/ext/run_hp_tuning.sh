@@ -31,7 +31,7 @@ BATCH_SIZES="1 16 32"
 # Number of Replicate runs per configuration for statistical smoothing
 REPLICATES=3
 
-# Epochs and Patience (Early stopping based on true LPFG cost)
+# Epochs and Patience (Early stopping based on true VLAB cost)
 MAX_EPOCHS=100
 PATIENCE=5
 

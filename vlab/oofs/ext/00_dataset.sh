@@ -7,6 +7,9 @@ cd "$SCRIPT_DIR"
 
 PRELIM_PLANT="Plant_023-1"
 
+# If set to 1, Stage 0 always rebuilds datasets from scratch.
+STAGE00_FORCE_RERUN="${STAGE00_FORCE_RERUN:-0}"
+
 FINAL_PLANTS=(
     "Plant_001-9"
     "Plant_006-25"
@@ -56,6 +59,18 @@ ensure_dataset() {
     local dataset_name="${plant_name}-${train_size}_${val_size}_${test_size}"
     local main_dir="Datasets/${dataset_name}"
     local alt_dir="Convergence Tests/Datasets/${dataset_name}"
+
+    if [[ "$STAGE00_FORCE_RERUN" == "1" ]]; then
+        log "Force rerun enabled; regenerating dataset files in: $main_dir"
+        mkdir -m 777 -p "$main_dir"
+        python3 generate_dataset.py \
+            --plant "$plant_name" \
+            --train_size "$train_size" \
+            --val_size "$val_size" \
+            --test_size "$test_size" \
+            --output_dir "$main_dir" | tee -a "$LOG_FILE"
+        return 0
+    fi
 
     if dataset_complete "$main_dir"; then
         log "Dataset already present: $main_dir"

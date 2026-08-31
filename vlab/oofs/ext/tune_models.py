@@ -11,6 +11,7 @@ import time
 import argparse
 import itertools
 import shutil
+import math
 import numpy as np
 import pandas as pd
 import random
@@ -94,11 +95,31 @@ def _params_to_list(best_params):
     return [float(value) for value in best_params]
 
 
+def resolve_thread_budget(available_cores, total_workers):
+    """Choose a thread budget that scales with the machine and worker count."""
+    available_cores = max(1, int(available_cores or 1))
+    total_workers = max(1, int(total_workers or 1))
+
+    if total_workers > 1:
+        return max(1, available_cores // total_workers)
+
+    return max(1, min(available_cores, int(round(2 * math.sqrt(available_cores)))))
+
+
 def attach_transcript(log_path):
     transcript = open(log_path, "a", buffering=1)
     sys.stdout = TeeStream(sys.stdout, transcript)
     sys.stderr = TeeStream(sys.stderr, transcript)
     return transcript
+
+
+def configure_torch_threads(available_cores, total_workers=1):
+    """Configure PyTorch CPU threading once before training begins."""
+    thread_budget = resolve_thread_budget(available_cores, total_workers)
+    torch.set_num_threads(thread_budget)
+    # Inter-op threads must be set before parallel work starts; keep it conservative.
+    torch.set_num_interop_threads(1)
+    return thread_budget
 
 # Define Hyperparameter Search Space
 DEFAULT_HP_GRID = {
@@ -334,9 +355,9 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
 
     # Write training log CSV header
     with open(log_csv, "w") as f:
-        f.write("epoch,train_loss,val_mse,val_r2,opt_surrogate_cost,opt_real_lpfg_cost,time_sec\n")
+        f.write("epoch,train_loss,val_mse,val_r2,opt_surrogate_cost,opt_real_vlab_cost,time_sec\n")
         
-    best_lpfg_cost = float('nan') if args.train_only else float('inf')
+    best_vlab_cost = float('nan') if args.train_only else float('inf')
     best_lpfg_params = None
     best_lpfg_surrogate_cost = float('nan') if args.train_only else float('inf')
     best_val_r2 = -float('inf')
@@ -352,7 +373,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             model, train_loader, optimizer, 
             data["real_bp_batch"], data["real_ep_batch"], 
             data["real_bp"], data["real_ep"],
-            config, training_log_csv=None, epoch_num=epoch+1
+            config, epoch_num=epoch+1
         )
         
         # 2. Standard Validation
@@ -370,13 +391,13 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             # Verify physically with LPFG
             syn_bp, syn_ep = run_simulation_verification(best_params, output_dir=verify_dir)
 
-            real_lpfg_cost = float('inf')
+            real_vlab_cost = float('inf')
             if syn_bp is not None:
-                real_lpfg_cost = evaluate_real_cost(syn_bp, syn_ep, data["real_bp"], data["real_ep"])
+                real_vlab_cost = evaluate_real_cost(syn_bp, syn_ep, data["real_bp"], data["real_ep"])
         else:
             best_params = None
             opt_cost = float('nan')
-            real_lpfg_cost = float('nan')
+            real_vlab_cost = float('nan')
 
         elapsed = time.time() - ep_start
         if args.train_only:
@@ -385,13 +406,13 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
         else:
             print(f"[{unique_run_name}] Ep {epoch+1}/{args.epochs} | "
                   f"Val R2: {val_metrics['r2']:.4f} (Best: {max(best_val_r2, val_metrics['r2']):.4f}) | "
-                  f"LPFG Cost: {real_lpfg_cost:.4f} (Best: {min(best_lpfg_cost, real_lpfg_cost):.4f})")
+                  f"VLAB Cost: {real_vlab_cost:.4f} (Best: {min(best_vlab_cost, real_vlab_cost):.4f})")
         
         with open(log_csv, "a") as f:
             f.write(f"{epoch+1},{train_loss:.6f},{val_metrics['loss']:.6f},{val_metrics['r2']:.6f},"
-                    f"{opt_cost:.6f},{real_lpfg_cost:.6f},{elapsed:.2f}\n")
+                    f"{opt_cost:.6f},{real_vlab_cost:.6f},{elapsed:.2f}\n")
 
-        # 4. Early Stopping strictly on Real LPFG Cost
+        # 4. Early Stopping strictly on Real VLAB Cost
         if val_metrics['r2'] > best_val_r2:
             best_val_r2 = val_metrics['r2']
             # Save a snapshot of the model with the best validation R2
@@ -401,8 +422,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             except Exception:
                 pass
 
-        if not args.train_only and real_lpfg_cost < best_lpfg_cost:
-            best_lpfg_cost = real_lpfg_cost
+        if not args.train_only and real_vlab_cost < best_vlab_cost:
+            best_vlab_cost = real_vlab_cost
             best_lpfg_params = best_params.detach().cpu().view(-1).clone()
             best_lpfg_surrogate_cost = float(opt_cost)
             patience_counter = 0
@@ -421,7 +442,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     print(f"[{unique_run_name}] Saved final model -> {final_model_path}")
 
     cleanup_empty_verify_dirs(model_dir)
-    log_status(f"[Worker] Finished {unique_run_name}. Best LPFG Score: {best_lpfg_cost:.4f} | Best R2: {best_val_r2:.4f}")
+    log_status(f"[Worker] Finished {unique_run_name}. Best LPFG Score: {best_vlab_cost:.4f} | Best R2: {best_val_r2:.4f}")
     transcript_handle.flush()
 
     # Final test-set R2 report with the exact vectors used in the calculation.
@@ -447,6 +468,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
         data["real_bp_batch"].to("cpu"),
         data["real_ep_batch"].to("cpu"),
     )
+    best_test_r2 = float(test_loader_report['r2'])
     test_r2_report_path = os.path.join(model_dir, "test_r2_report.txt")
     sample_count = min(10, test_loader_report["preds"].numel())
     with open(test_r2_report_path, "w") as rf:
@@ -479,8 +501,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
                 "plant",
                 "dataset_fraction",
                 "epochs_trained",
-                "best_val_r2",
-                "best_lpfg_cost",
+                "best_test_r2",
+                "best_vlab_cost",
                 "best_lpfg_surrogate_cost",
                 *LSYSTEM_PARAM_NAMES,
             ])
@@ -491,8 +513,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
                 args.plant,
                 args.dataset_fraction,
                 total_epochs_trained,
-                f"{best_val_r2:.6f}",
-                f"{best_lpfg_cost:.6f}",
+                f"{best_test_r2:.6f}",
+                f"{best_vlab_cost:.6f}",
                 f"{best_lpfg_surrogate_cost:.6f}",
                 *[f"{value:.10f}" for value in _params_to_list(best_lpfg_params)],
             ])
@@ -502,7 +524,7 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
     summary_csv = os.path.join(run_dir, "tuning_summary.csv")
     write_header = not os.path.exists(summary_csv)
     
-    summary_lpfg_cost = "" if args.train_only else f"{best_lpfg_cost:.6f}"
+    summary_vlab_cost = "" if args.train_only else f"{best_vlab_cost:.6f}"
     summary_lpfg_surrogate_cost = "" if args.train_only else f"{best_lpfg_surrogate_cost:.6f}"
 
     with open(summary_csv, "a", newline="") as f:
@@ -515,8 +537,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
                 "batch_size",
                 "dataset_fraction",
                 "epochs_trained",
-                "best_val_r2",
-                "best_lpfg_cost",
+                "best_test_r2",
+                "best_vlab_cost",
                 "best_lpfg_surrogate_cost",
                 *[f"opt_{name}" for name in LSYSTEM_PARAM_NAMES],
             ])
@@ -527,8 +549,8 @@ def end_to_end_tuning_worker(config, run_dir, data, train_ds_args, val_ds_args, 
             config["batch_size"],
             args.dataset_fraction,
             total_epochs_trained,
-            f"{best_val_r2:.6f}",
-            summary_lpfg_cost,
+            f"{best_test_r2:.6f}",
+            summary_vlab_cost,
             summary_lpfg_surrogate_cost,
             *[f"{value:.10f}" for value in _params_to_list(best_lpfg_params)],
         ])
@@ -549,7 +571,7 @@ def main():
     parser.add_argument("--replicates", type=int, default=2, help="Replicates per config")
     parser.add_argument("--dataset-fraction", type=float, default=1.0, help="Fraction of training subset to test convergence")
     parser.add_argument("--epochs", type=int, default=50, help="Max epochs allowed before forced stop")
-    parser.add_argument("--patience", type=int, default=5, help="Patience for early stopping based on real LPFG Cost")
+    parser.add_argument("--patience", type=int, default=5, help="Patience for early stopping based on real VLAB Cost")
     parser.add_argument("--opt-restarts", type=int, default=3, help="Optimizer restarts per evaluation")
     parser.add_argument("--opt-steps", type=int, default=200, help="Optimizer steps per evaluation restart")
     parser.add_argument("--learning-rates", type=float, nargs="+", default=[1e-3, 5e-4], help="Space-separated list of learning rates to test")
@@ -560,6 +582,13 @@ def main():
     args = parser.parse_args()
 
     print("--- End-to-End Tuning & Convergence ---")
+
+    try:
+        thread_budget = configure_torch_threads(os.cpu_count(), total_workers=1)
+        print(f"[Run] Torch thread budget: intra_op={thread_budget}, inter_op=1")
+    except RuntimeError as e:
+        # If a caller already initialized torch parallelism, continue with current settings.
+        print(f"[Run] Warning: could not set torch thread config ({e})")
     
     data = load_data(args.dataset, args.plant)
     if data is None: 

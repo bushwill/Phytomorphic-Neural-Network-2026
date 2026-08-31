@@ -126,7 +126,7 @@ def parse_tuning_dirs(base_dir="Hyperparameter Tuning"):
                 key = (model_name, frac, epochs)
                 results[key].append({
                     'r2': float(row['best_val_r2']),
-                    'cost': float(row['best_lpfg_cost']),
+                    'cost': float(row.get('best_vlab_cost', row.get('best_lpfg_cost'))),
                     'surrogate_cost': float(row.get('best_lpfg_surrogate_cost', 'nan')),
                     'epochs': epochs,
                     'fraction': frac,
@@ -185,7 +185,7 @@ def generate_convergence_summary(results, summary_file, tuning_dir=""):
         for (model, frac, epochs), data_list in results.items():
             by_model_frac[model][frac].append((epochs, data_list))
         
-        # OPTIMIZED HYPERPARAMETER SETS (LPFG cost first, R² retained)
+        # OPTIMIZED HYPERPARAMETER SETS (VLAB cost first, R² retained)
         f.write("="*150 + "\n")
         f.write("OPTIMIZED HYPERPARAMETER SETS\n")
         f.write("="*150 + "\n\n")
@@ -370,7 +370,7 @@ def generate_convergence_summary(results, summary_file, tuning_dir=""):
         f.write("KEY FINDINGS & RECOMMENDATIONS:\n")
         f.write("="*150 + "\n\n")
         
-        f.write("1. LEARNING CURVES (LPFG Cost primary, R² secondary at Max Epochs):\n\n")
+        f.write("1. LEARNING CURVES (VLAB Cost primary, R² secondary at Max Epochs):\n\n")
         for model in models:
             f.write(f"   {model.upper()}:\n")
             best_epochs = max(epoch_counts)
@@ -403,7 +403,7 @@ def generate_convergence_summary(results, summary_file, tuning_dir=""):
                     f.write(f"     {frac_pct:>5.0f}% → {avg_ratio:.1%} of max epochs (early stopping effective: {avg_ratio < 0.6})\n")
             f.write("\n")
         
-        f.write("3. MODEL COMPARISON AT FULL DATA (100%, LPFG Cost first):\n\n")
+        f.write("3. MODEL COMPARISON AT FULL DATA (100%, VLAB Cost first):\n\n")
         best_epochs = max(epoch_counts)
         f.write(f"   At {best_epochs} max epochs (best configuration):\n\n")
         f.write(f"   {'Model':<12} {'Avg Cost':<15} {'Best Cost':<15} {'Avg R²':<12} {'Std R²':<12}\n")
@@ -420,7 +420,7 @@ def generate_convergence_summary(results, summary_file, tuning_dir=""):
                 best_cost = min(cost_vals)
                 f.write(f"   {model:<12} {avg_cost:<15.1f} {best_cost:<15.1f} {avg_r2:<12.4f} {std_r2:<12.4f}\n")
 
-            f.write("\n4. MINIMUM DATA FOR CONVERGENCE (>90% R², with LPFG Cost shown):\n\n")
+            f.write("\n4. MINIMUM DATA FOR CONVERGENCE (>90% R², with VLAB Cost shown):\n\n")
         for model in models:
             f.write(f"   {model.upper()}:\n")
             best_epochs = max(epoch_counts)
@@ -449,7 +449,7 @@ def generate_convergence_summary(results, summary_file, tuning_dir=""):
             f.write("\n")
         
         f.write("5. RECOMMENDATIONS:\n\n")
-        f.write("   • Prioritize lower LPFG cost when selecting final configurations\n")
+        f.write("   • Prioritize lower VLAB cost when selecting final configurations\n")
         f.write("   • Use R² as a secondary model-quality indicator, not the primary objective\n")
         f.write("   • Use minimum fraction that achieves >90% R² for efficient training\n")
         f.write("   • Lower early stopping % ratio indicates better generalization potential\n")
