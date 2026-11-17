@@ -1,0 +1,2 @@
+g++ -O3 -std=gnu++11 -fPIC -c lsys.ii -Wno-return-type-c-linkage
+g++ -O3 -std=gnu++11 -fPIC -shared -Xlinker -Bsymbolic -o lsys.so lsys.o

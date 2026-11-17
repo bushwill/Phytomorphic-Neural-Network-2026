@@ -146,6 +146,29 @@ def parse_dataframe(bin_c):
     return info, ep, bp, length_edge, root
 
 
+def read_real_plant_day(plant_name, target_day, image_root=None):
+    """Load one real-plant topology image and extract its landmarks.
+
+    The image conversion, threshold, and landmark parser are intentionally the
+    same ones used by :func:`read_real_plants`. Returns ``(image, bp, ep)`` so
+    callers can also display the exact source image used for extraction.
+    """
+    if image_root is None:
+        image_root = plant_images_path
+
+    image_name = os.path.join(
+        os.fspath(image_root),
+        plant_name,
+        "topo",
+        f"Day_{int(target_day):03d}.png",
+    )
+    image = io.imread(image_name)
+    image_gray = color.rgb2gray(color.rgba2rgb(image))
+    binary_plant = image_gray > 0.1
+    _, ep, bp, _, _ = parse_dataframe(binary_plant)
+    return image, bp, ep
+
+
 def read_real_plants(plant_name=None):
     if plant_name is None:
         plant_name = real_plant_name
@@ -182,10 +205,7 @@ def read_real_plants(plant_name=None):
             image_name = current_plant_path + "/topo/Day_0" + str(target_day) + ".png"
 
         if os.path.exists(image_name):
-            image = io.imread(image_name)
-            image_gray = color.rgb2gray(color.rgba2rgb(image))
-            bin = image_gray > 0.1
-            info_c, ep_c, bp_c, length_c, root_c = parse_dataframe(bin)
+            _, bp_c, ep_c = read_real_plant_day(plant_name, target_day)
             last_valid_bp = bp_c
             last_valid_ep = ep_c
             real_bp.append(bp_c)
@@ -499,20 +519,27 @@ def compute_normalization_stats(num_samples = 100, real_bp=None, real_ep=None):
     return (np.mean(params_collection, axis=0), np.std(params_collection, axis=0),
             np.mean(cost_collection), np.std(cost_collection))
     
-def generate_plant(param_file, output_dir):
+def generate_plant(param_file, output_dir, animation=False, width=306, height=256):
     """
     Generate a plant using lpfg and save results in output_dir.
     Runs inside output_dir to prevent CWD file collisions (e.g. leafposition.dat).
+
+    Set ``animation=True`` to pass the project's ``anim.a`` driver to LPFG and
+    save rendered developmental-day frames alongside the projected output.
+    ``width`` and ``height`` control the LPFG rendered frame resolution.
+    Animated landmarks use LPFG's exported ``projection.txt`` view volume;
+    non-animated generation retains the legacy dataset projection.
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
-    # Compile project if needed (in original CWD)
-    if not os.path.exists("project"):
-        ret = os.system("g++ -o project -Wall -Wextra lsystem/project.cpp -lm")
-        if ret != 0:
-            print("Error: Compilation of lsystem/project.cpp failed. Exiting.")
-            sys.exit(1)
+    project_source = os.path.join("lsystem", "project.cpp")
+    if (not os.path.exists("project") or
+            os.path.getmtime(project_source) > os.path.getmtime("project")):
+        subprocess.run(
+            ["g++", "-o", "project", "-Wall", "-Wextra", project_source, "-lm"],
+            check=True,
+        )
 
     # Get absolute paths to run safely from output_dir
     cwd = os.getcwd()
@@ -524,24 +551,58 @@ def generate_plant(param_file, output_dir):
     def ls(f): return os.path.join(cwd, "lsystem", f)
 
     # Build lpfg command components (Using absolute paths)
-    lpfg_args = [
-        "lpfg", 
-        "-w", "306", "256", 
-        ls("lsystem.l"), 
+    lpfg_args = ["lpfg", "-w", str(width), str(height)]
+    if animation:
+        lpfg_args.extend(["-a", ls("anim.a")])
+    lpfg_args.extend([
+        ls("lsystem.l"),
         ls("view.v"), 
         ls("materials.mat"), 
         ls("contours.cset"), 
         ls("functions.fset"), 
         ls("functions.tset"), 
         abs_param_file
-    ]
+    ])
 
     # Run lpfg inside output_dir
     # This ensures leafposition.dat is created inside output_dir, not CWD
     log_file = os.path.join(abs_output_dir, "lpfg_log.txt")
     with open(log_file, "w") as f_log:
-        process = subprocess.Popen(lpfg_args, cwd=abs_output_dir, stdout=f_log, stderr=subprocess.STDOUT)
-        process.wait()
+        process = subprocess.run(
+            lpfg_args,
+            cwd=abs_output_dir,
+            stdout=f_log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if process.returncode != 0:
+        raise RuntimeError(f"LPFG failed with exit code {process.returncode}; see {log_file}")
+
+    project_width = 2454
+    project_height = 2056
+    if animation:
+        # LPFG's requested window height can include window-manager borders.
+        # Use the actual rendered image dimensions for project so its pixel
+        # coordinates use precisely the same viewport as the saved frames.
+        frame_name = next(
+            (
+                name for name in os.listdir(abs_output_dir)
+                if name.startswith("maize") and name.endswith(".png")
+            ),
+            None,
+        )
+        if frame_name is None:
+            raise RuntimeError(
+                f"Animated LPFG produced no maize*.png frames; see {log_file}"
+            )
+        rendered_frame = io.imread(os.path.join(abs_output_dir, frame_name))
+        project_height, project_width = rendered_frame.shape[:2]
+        projection_file = os.path.join(abs_output_dir, "projection.txt")
+        if not os.path.isfile(projection_file) or not os.path.getsize(projection_file):
+            raise RuntimeError(
+                f"Animated LPFG produced no rendered view volume: {projection_file}; "
+                f"see {log_file}"
+            )
 
     # Run project executable to process leafposition.dat
     # Expected input: ./project Width Height InputFile
@@ -551,9 +612,14 @@ def generate_plant(param_file, output_dir):
     
     with open(output_file, "w") as f_out:
         # execute project binary using absolute path
-        p_args = [project_exe, "2454", "2056", leafval_file]
-        p_proc = subprocess.Popen(p_args, cwd=abs_output_dir, stdout=f_out)
-        p_proc.wait()
+        p_args = [project_exe, str(project_width), str(project_height), leafval_file]
+        if animation:
+            p_args.append(projection_file)
+        p_proc = subprocess.run(p_args, cwd=abs_output_dir, stdout=f_out, check=False)
+    if p_proc.returncode != 0:
+        raise RuntimeError(
+            f"project failed with exit code {p_proc.returncode}; see {output_file}"
+        )
 
 def read_syn_plant(file_name):
     """

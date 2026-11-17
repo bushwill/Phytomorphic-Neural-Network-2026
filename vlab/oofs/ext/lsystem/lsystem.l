@@ -45,6 +45,7 @@ int num_leaves;
 float sim_time = 0.;
 float print_time = PRINT_DT;
 int whichGroup = 1;
+bool projection_written = false;
 
 FILE *leafNumberFile = NULL;
 FILE *leafPositionFile = NULL;
@@ -55,6 +56,7 @@ Start: {
     sim_time = 0.;
     print_time = PRINT_DT;
     whichGroup = 1;
+    projection_written = false;
     sran(time(NULL));
 
     // create the leaf number file
@@ -95,6 +97,23 @@ EndEach: {
     
     else if (whichGroup == 2) {
     	DisplayFrame();
+
+        if (!projection_written) {
+            FILE *projectionFile = fopen("projection.txt", "w");
+            if (!projectionFile) {
+                perror("Cannot write projection.txt");
+                exit(1);
+            }
+            // Export the rendered view, not the legacy training projection.
+            fprintf(projectionFile, "%.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                vvXmin(0), vvXmax(0), vvYmin(0), vvYmax(0),
+                vvZmin(0), vvZmax(0), vvScale(0));
+            if (fclose(projectionFile) != 0) {
+                perror("Cannot close projection.txt");
+                exit(1);
+            }
+            projection_written = true;
+        }
 
         // output if number of leaves > 0 
         static int frame = 1;
@@ -253,4 +272,3 @@ VisualAid() : {
     nproduce SB StartGC() F(h) EndGC() EB; 
     produce;
 }
-

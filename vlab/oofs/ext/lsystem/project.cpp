@@ -1,6 +1,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 
 // Include all GLM core / GLSL features
 #include "glm/glm.hpp" // vec2, vec3, mat4, radians
@@ -68,7 +69,7 @@ void ProjectionSetModifiers() { //const WindowParams::ViewModifiers &vm) {
 
 inline float Deg2Rad(float deg) { return deg * M_PI / 180.0f; }
 
-void ProjectionSetVolume() { //Volume v, const Clipping &clip) {
+bool ProjectionSetVolume(const char *view_volume_path) {
   const float MinDim = 0.1f;
   const float HalfDepthCoef = 0.525f;
   const float MinHalfDepth = 0.5f;
@@ -84,6 +85,20 @@ void ProjectionSetVolume() { //Volume v, const Clipping &clip) {
   float _maxY = 9.18;
   float _minZ = -9.9089;
   float _maxZ = 9.9089;
+  if (view_volume_path != nullptr) {
+    std::ifstream view_volume(view_volume_path);
+    if (!(view_volume >> _minX >> _maxX >> _minY >> _maxY
+                      >> _minZ >> _maxZ >> _scale) ||
+        !std::isfinite(_minX) || !std::isfinite(_maxX) ||
+        !std::isfinite(_minY) || !std::isfinite(_maxY) ||
+        !std::isfinite(_minZ) || !std::isfinite(_maxZ) ||
+        !std::isfinite(_scale) ||
+        _minX >= _maxX || _minY >= _maxY || _minZ >= _maxZ || _scale <= 0) {
+      std::cerr << "Error: invalid rendered view volume: "
+                << view_volume_path << std::endl;
+      return false;
+    }
+  }
   glm::vec3 v_min = glm::vec3(_minX,_minY,_minZ);
   glm::vec3 v_max = glm::vec3(_maxX,_maxY,_maxZ);
 
@@ -114,22 +129,25 @@ void ProjectionSetVolume() { //Volume v, const Clipping &clip) {
 
   _ZShift = _minWidth * _scale / std::tanh(Deg2Rad(_fov * 0.5f)) + _HalfDepth;
   _vratio = _minWidth / _minHeight;
+  return true;
 }
 
 
 int main(int argc, char *argv[]) {
 
-  if (argc < 4) {
-    std::cerr << "Usage: " << argv[0] << " width height inputfile" << std::endl;
+  if (argc < 4 || argc > 5) {
+    std::cerr << "Usage: " << argv[0] << " width height inputfile [view-volume-file]" << std::endl;
     std::cerr << "\twidth: the width of the lpfg window / output image" << std::endl;
     std::cerr << "\theight: the height of the lpfg window / output image" << std::endl;
     std::cerr << "\tinputfile: name of file with 3D positions of organs,\n\t\twith x,y,z coordinates given on each line" << std::endl; 
+    std::cerr << "\tview-volume-file: optional LPFG xmin xmax ymin ymax zmin zmax scale;\n"
+              << "\t\tomitting it preserves the legacy dataset projection" << std::endl;
     return 1;
   }
 
   _WindowSize_w = std::atoi(argv[1]);
   _WindowSize_h = std::atoi(argv[2]);
-  if (_WindowSize_w < 0 || _WindowSize_h < 0) {
+  if (_WindowSize_w <= 0 || _WindowSize_h <= 0) {
       std::cerr << "Error: window width and height must be greater than zero\n";
       return 1;
   }
@@ -137,7 +155,9 @@ int main(int argc, char *argv[]) {
   // set projection parameters
   ProjectionSetModifiers();
 
-  ProjectionSetVolume();
+  if (!ProjectionSetVolume(argc == 5 ? argv[4] : nullptr)) {
+    return 1;
+  }
 
   // construct the projection matrix
   float nearClip = _ZShift - _HalfDepth, farClip = _ZShift + _HalfDepth;
@@ -233,4 +253,3 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
-
